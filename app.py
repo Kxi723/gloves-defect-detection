@@ -42,10 +42,14 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 # The assignment asks the operator to run a handful of photos at a time.
 # Fewer is allowed, but the counter says so in red.
-RECOMMENDED_MIN_IMAGES = 5
+RECOMMENDED_MIN_IMAGES = 1
 
 TILE = 104          # contact-sheet thumbnail edge, before DPI scaling
 TILE_GAP = 10
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PHOTO_DIR = PROJECT_ROOT / "gloves"          # where the photo set lives
+OUTPUT_DIR = PROJECT_ROOT / "output"         # where annotated copies go
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +120,12 @@ class DefectApp:
         self.root.geometry(f"{width}x{height}")
         self.root.minsize(px(1120), px(700))
         self.root.configure(bg=theme.APP_BG)
+
+        # Where the file dialogs open. Starts at the project's own photo
+        # folder so the common case takes no navigation at all, then follows
+        # the operator once they pick somewhere else.
+        self._browse_dir = PHOTO_DIR if PHOTO_DIR.is_dir() else PROJECT_ROOT
+        self._save_dir = OUTPUT_DIR if OUTPUT_DIR.is_dir() else PROJECT_ROOT
 
         self.pool: List[Path] = []
         self.tiles: List[PhotoTile] = []
@@ -344,9 +354,11 @@ class DefectApp:
     # ------------------------------------------------------------------ #
 
     def open_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Choose a folder of glove photos")
+        folder = filedialog.askdirectory(title="Choose a folder of glove photos",
+                                         initialdir=str(self._browse_dir))
         if not folder:
             return
+        self._browse_dir = Path(folder)
         found = sorted(p for p in Path(folder).iterdir()
                        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
         if not found:
@@ -360,10 +372,12 @@ class DefectApp:
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
             title="Choose glove photos",
+            initialdir=str(self._browse_dir),
             filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff"),
                        ("All files", "*.*")])
         if not paths:
             return
+        self._browse_dir = Path(paths[0]).parent
         known = set(self.pool)
         for raw in paths:
             path = Path(raw)
@@ -677,10 +691,12 @@ class DefectApp:
         rows = [r for r in self.rows if r.annotated is not None]
         if not rows:
             return
-        folder = filedialog.askdirectory(title="Save annotated photos into")
+        folder = filedialog.askdirectory(title="Save annotated photos into",
+                                         initialdir=str(self._save_dir))
         if not folder:
             return
         target = Path(folder)
+        self._save_dir = target
         written = 0
         for row in rows:
             name = f"{Path(row.name).stem}_{row.status.replace(' ', '-')}.png"
