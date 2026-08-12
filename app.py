@@ -47,6 +47,8 @@ RECOMMENDED_MIN_IMAGES = 1
 TILE = 104          # contact-sheet thumbnail edge, before DPI scaling
 TILE_GAP = 10
 
+PREVIEW_PLACEHOLDER = "Select a row to view the annotated photo"
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 PHOTO_DIR = PROJECT_ROOT / "gloves"          # where the photo set lives
 OUTPUT_DIR = PROJECT_ROOT / "output"         # where annotated copies go
@@ -151,6 +153,9 @@ class DefectApp:
         self._build_body()
         self._build_statusbar()
         self.root.after(50, self._drain_queue)
+        # After the first idle pass, so the sheet lays its tiles out against
+        # a real window width instead of the placeholder one.
+        self.root.after(80, self._autoload_photos)
 
     # ------------------------------------------------------------------ #
     # Chrome
@@ -325,7 +330,7 @@ class DefectApp:
         self.stage = tk.Frame(stage, bg=theme.STAGE)
         self.stage.grid(row=0, column=0, sticky="nsew")
         self.preview = tk.Label(self.stage, bg=theme.STAGE,
-                                text="Select a row to view the annotated photo",
+                                text=PREVIEW_PLACEHOLDER,
                                 font=theme.font(9), fg=theme.INK_FAINT, bd=0)
         self.preview.place(relx=0.5, rely=0.5, anchor="center")
         self.stage.bind("<Configure>", self._on_stage_resize)
@@ -353,14 +358,41 @@ class DefectApp:
     # Card 2 behaviour
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _images_in(folder: Path) -> List[Path]:
+        try:
+            return sorted(p for p in folder.iterdir()
+                          if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+        except OSError:
+            return []
+
+    def _autoload_photos(self) -> None:
+        """Fill the contact sheet from the project's own photo folder.
+
+        Nothing is selected, unlike the explicit *Open folder*. Starting a
+        session with every photo ticked means one stray click on a defect
+        launches a run over the whole folder, and a run cannot be cancelled
+        once it starts. The operator has expressed no intent yet at startup,
+        so the sheet waits for them to pick.
+        """
+        if self.pool:
+            return
+        found = self._images_in(PHOTO_DIR)
+        if not found:
+            return
+        self.pool = found
+        self.selected = set()
+        self._rebuild_sheet()
+        self._set_status(f"{len(found)} photo(s) from {PHOTO_DIR.name}/  ·  "
+                         f"pick the ones to inspect, then a defect.")
+
     def open_folder(self) -> None:
         folder = filedialog.askdirectory(title="Choose a folder of glove photos",
                                          initialdir=str(self._browse_dir))
         if not folder:
             return
         self._browse_dir = Path(folder)
-        found = sorted(p for p in Path(folder).iterdir()
-                       if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+        found = self._images_in(Path(folder))
         if not found:
             messagebox.showinfo("No photos", "That folder has no images in it.")
             return
@@ -672,7 +704,9 @@ class DefectApp:
 
     def _render_preview(self) -> None:
         if self.preview_image is None:
-            self.preview.configure(image="", text="(no image to show)")
+            # Reached on a cold start too, because the first <Configure> of
+            # the stage fires before anything has been inspected.
+            self.preview.configure(image="", text=PREVIEW_PLACEHOLDER)
             return
         self.stage.update_idletasks()
         width = max(self.stage.winfo_width() - px(20), px(200))
