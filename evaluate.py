@@ -5,18 +5,25 @@ Eyeballing annotated images cannot tell you whether a change helped or
 just moved errors around, so every tuning decision should be checked here
 instead.
 
-Ground truth comes from the filename by default, using the convention
+Ground truth comes from the filename, using the convention
 
-    <anything>_<material>_<n>.jpeg      e.g. kxi_latex_3.jpeg
+    <defect>_<material>_<n>.jpg          e.g. fold_cotton_01.jpg
 
-together with the material -> defect mapping in DEFECT_BY_MATERIAL below.
-Photos of undamaged gloves must be named with the material followed by
-"good", e.g. ``kxi_latex_good_1.jpeg``; they are what makes precision
-meaningful, because without them a detector that fires on everything
-scores a perfect recall.
+The defect keyword and the material are read independently, so the same
+defect can be photographed on several materials — which the brief requires
+— and any combination scores correctly.
+
+    good_latex_01.jpg    undamaged; any detector firing is a false positive
+    fold_cotton_02.jpg   a fold crease, on cotton
+    tear_nitrile_05.jpg  a fingertip tear, on nitrile
+
+Undamaged photos are what make precision meaningful: without them a
+detector that fires on everything scores perfect recall and nothing
+contradicts it.
 
 Usage:
     python evaluate.py                    # gloves/ , labels from filenames
+    python evaluate.py --by-material      # also break results down per material
     python evaluate.py -i photos --holdout 20
 """
 
@@ -32,31 +39,44 @@ import cv2
 
 from gdd.pipeline import GloveInspector, InspectionReport
 
-# Which defect each material was photographed to demonstrate. Keys must
-# match a DefectSpec.key in detectors/__init__.py. Update when the photo
-# set changes.
-DEFECT_BY_MATERIAL: Dict[str, str] = {
-    "latex": "damage_by_fold",
-    "cotton": "dirty",
-    "nitrile": "tearing_at_finger",
+# Filename keyword -> detector key (must match a DefectSpec.key in
+# detectors/__init__.py). None marks an undamaged glove.
+#
+# Read independently of the material, so a defect photographed on two
+# materials scores correctly on both. An earlier version mapped material ->
+# defect, which silently mislabelled every cross-material photo.
+DEFECT_KEYWORDS: Dict[str, Optional[str]] = {
+    "fold": "damage_by_fold",
+    "dirty": "dirty",
+    "tear": "tearing_at_finger",
+    "good": None,
 }
+
+MATERIALS = ("cotton", "latex", "nitrile")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def label_from_filename(path: Path) -> Tuple[Optional[str], Set[str]]:
+def label_from_filename(path: Path) -> Tuple[Optional[str], Optional[Set[str]]]:
     """(material, expected defect names) parsed from a filename.
 
-    An empty defect set means the photo is of an undamaged glove, so every
-    detector firing on it counts as a false positive.
+    Returns ``(material, None)`` when the name carries no defect keyword, so
+    the caller can skip it rather than silently scoring it as undamaged.
+    An empty *set* is different: it means the photo IS labelled undamaged,
+    and every detector firing on it counts as a false positive.
+
+    Matching is by whole word between underscores, so a material name can
+    never be mistaken for a defect keyword or vice versa.
     """
-    stem = path.stem.lower()
-    material = next((m for m in DEFECT_BY_MATERIAL if m in stem), None)
-    if material is None:
-        return None, set()
-    if re.search(r"(^|_)(good|ok|clean|nodefect)(_|$)", stem):
-        return material, set()
-    return material, {DEFECT_BY_MATERIAL[material]}
+    parts = set(re.split(r"[_\-. ]+", path.stem.lower()))
+    material = next((m for m in MATERIALS if m in parts), None)
+
+    labelled = parts & set(DEFECT_KEYWORDS)
+    if not labelled:
+        return material, None
+    expected = {DEFECT_KEYWORDS[word] for word in labelled}
+    expected.discard(None)      # "good" contributes no expected defect
+    return material, expected
 
 
 def score_counts(reports: List[Tuple[InspectionReport, Set[str]]],
@@ -89,6 +109,10 @@ def main() -> int:
         "--holdout", type=int, default=0, metavar="PERCENT",
         help="reserve this %% of photos as a test set and report it "
              "separately; tune only against the calibration half")
+    parser.add_argument(
+        "--by-material", action="store_true",
+        help="also break each detector down per material, which is the "
+             "evidence that a detector works on more than one of them")
     args = parser.parse_args()
 
     folder = Path(args.input)
@@ -100,21 +124,28 @@ def main() -> int:
 
     inspector = GloveInspector()
     evaluated: List[Tuple[InspectionReport, Set[str]]] = []
+    materials: List[Optional[str]] = []
     unlabelled: List[str] = []
 
     for path in images:
         material, expected = label_from_filename(path)
-        if material is None:
+        if expected is None:
             unlabelled.append(path.name)
             continue
         image = cv2.imread(str(path))
         if image is None:
             continue
         evaluated.append((inspector.inspect(image, path.name), expected))
+        materials.append(material)
 
     if unlabelled:
-        print(f"Skipped {len(unlabelled)} file(s) with no recognisable "
-              f"material in the name: {', '.join(unlabelled[:5])}")
+        print(f"Skipped {len(unlabelled)} file(s) with no defect keyword "
+              f"({'/'.join(DEFECT_KEYWORDS)}) in the name: "
+              f"{', '.join(unlabelled[:5])}")
+    if not evaluated:
+        print("Nothing labelled to evaluate. Name photos like "
+              "fold_cotton_01.jpg or good_latex_02.jpg.", file=sys.stderr)
+        return 1
 
     # --- split -------------------------------------------------------- #
     groups = {"all photos": evaluated}
@@ -135,6 +166,23 @@ def main() -> int:
             tp, fp, fn, tn = score_counts(subset, detector)
             print(f"{detector:18} {tp:3d} {fp:3d} {fn:3d} {tn:3d}  "
                   f"{ratio(tp, tp + fp):>9} {ratio(tp, tp + fn):>7}")
+
+        if args.by_material and subset is evaluated:
+            print("\n  per material (recall on photos that should show the "
+                  "defect; '-' means none were shot)")
+            present = [m for m in MATERIALS if m in materials]
+            print("    " + f"{'detector':18}" +
+                  "".join(f"{m:>12}" for m in present))
+            for detector in inspector.detector_names:
+                cells = []
+                for mat in present:
+                    rows = [(r, e) for (r, e), m in zip(subset, materials)
+                            if m == mat]
+                    tp, fp, fn, _ = score_counts(rows, detector)
+                    cells.append(f"{ratio(tp, tp + fn):>9} " if tp + fn
+                                 else f"{'-':>9} ")
+                    cells[-1] = cells[-1].rjust(12)
+                print("    " + f"{detector:18}" + "".join(cells))
 
         negatives = sum(1 for _, exp in subset if not exp)
         if negatives == 0:
