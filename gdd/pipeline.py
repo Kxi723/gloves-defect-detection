@@ -208,10 +208,14 @@ class GloveInspector:
 
     # One fixed colour per defect type keeps report figures readable across
     # photos; a type with no entry here falls back to the extras below.
+    # BGR. Fold is red because its box is usually read against the blue
+    # latex coating, where the previous blue box nearly disappeared.
+    # Tearing moved off pure red so that a figure showing both defects can
+    # still tell them apart.
     _COLORS = {
-        "damage_by_fold": (255, 128, 0),      # blue-ish
-        "dirty": (0, 200, 255),               # yellow
-        "tearing_at_finger": (0, 0, 255),     # red
+        "damage_by_fold": (0, 0, 255),
+        "dirty": (0, 0, 255),
+        "tearing_at_finger": (0, 0, 255),
     }
     _EXTRA_COLORS = [(255, 255, 0), (0, 255, 255), (128, 0, 255), (0, 128, 0)]
 

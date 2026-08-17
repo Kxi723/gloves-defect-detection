@@ -125,6 +125,67 @@ def local_texture_energy(image: np.ndarray, window: int) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# Colour: telling a foreign material from a trick of the light
+# --------------------------------------------------------------------------- #
+
+def lab_chroma(image: np.ndarray) -> np.ndarray:
+    """The LAB (a*, b*) planes, re-centred so neutral grey sits at (0, 0).
+
+    OpenCV stores 8-bit a* and b* with 128 as the neutral point. Shifting
+    that to zero turns each pixel into a chroma *vector*, whose direction
+    is the hue and whose length is the colourfulness — which is what
+    :func:`off_hue_distance` needs.
+    """
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    return lab[:, :, 1:] - 128.0
+
+
+def median_chroma(chroma: np.ndarray, mask: np.ndarray) -> Tuple[float, float]:
+    """Median (a*, b*) chroma vector over a masked region.
+
+    Median rather than mean for the usual reason (see :func:`robust_stats`):
+    on a heaped powder the material still shows between the grains, and a
+    mean would average the two colours into something that is neither.
+    """
+    values = chroma[mask]
+    return float(np.median(values[:, 0])), float(np.median(values[:, 1]))
+
+
+def off_hue_distance(region: Tuple[float, float],
+                     reference: Tuple[float, float]) -> float:
+    """How far a region's colour sits off the glove's own hue ray.
+
+    Lighting can only move a surface's colour ALONG the ray that runs from
+    neutral grey through that surface's own hue. A specular highlight
+    washes the colour toward neutral, a shadow deepens it away from
+    neutral, but neither can shift it sideways to a different hue, and
+    neither can push it out the far side past neutral into the opposite
+    hue. So the perpendicular distance from that ray measures the part of
+    a colour difference that illumination cannot account for — which is
+    the part that means foreign matter.
+
+    Anything behind the neutral point (projection <= 0) has crossed to the
+    opposite hue and counts as fully off-ray.
+
+    Measured on the current set, for candidate regions on the blue latex
+    glove: the cream coffee powder scored 34.7, while the two specular
+    highlights on undamaged gloves scored 5.1 and 6.4.
+
+    Meaningless when the glove itself is near neutral, because then the ray
+    has no well-defined direction — the caller must gate on the reference
+    length (``DirtConfig.min_glove_chroma``).
+    """
+    ref_length = math.hypot(*reference)
+    if ref_length < 1e-6:
+        return math.hypot(*region)
+    unit_a, unit_b = reference[0] / ref_length, reference[1] / ref_length
+    projection = region[0] * unit_a + region[1] * unit_b
+    if projection <= 0.0:
+        return math.hypot(*region)
+    return abs(region[0] * unit_b - region[1] * unit_a)
+
+
+# --------------------------------------------------------------------------- #
 # Contour analysis: convexity defects, holes, fingertips
 # --------------------------------------------------------------------------- #
 
@@ -219,22 +280,67 @@ def find_holes(seg: SegmentationResult, min_area: float, max_area: float,
     return holes
 
 
+def cut_by_frame(mask: np.ndarray, point: Tuple[int, int],
+                 palm_radius: float, reach_ratio: float) -> bool:
+    """Does the glove run off the image edge near ``point``?
+
+    A hull extreme is only evidence of a real extremity when the end of
+    that protrusion was actually photographed. Where the silhouette is
+    sliced by the frame, the "tip" is just the cut, and nothing about the
+    limb beyond it is known.
+    """
+    if reach_ratio <= 0:
+        return False
+    height, width = mask.shape[:2]
+    reach = max(1, int(reach_ratio * palm_radius))
+    x0, x1 = max(0, point[0] - reach), min(width, point[0] + reach + 1)
+    y0, y1 = max(0, point[1] - reach), min(height, point[1] + reach + 1)
+
+    edges = []
+    if y0 == 0:
+        edges.append(mask[0, x0:x1])
+    if y1 == height:
+        edges.append(mask[height - 1, x0:x1])
+    if x0 == 0:
+        edges.append(mask[y0:y1, 0])
+    if x1 == width:
+        edges.append(mask[y0:y1, width - 1])
+    return any(bool(np.any(edge)) for edge in edges)
+
+
 def locate_fingertips(seg: SegmentationResult, min_tip_distance_ratio: float,
                       merge_separation_ratio: float,
-                      max_tips: int = 5) -> List[Tuple[int, int]]:
+                      max_tips: int = 5,
+                      frame_cut_reach_ratio: float = 0.5
+                      ) -> List[Tuple[int, int]]:
     """Fingertip points from convex-hull extremes. No orientation assumed.
 
     1. Palm centre and radius from the distance transform.
     2. Hull points further than ``min_tip_distance_ratio`` palm radii from
        the centre are fingertip candidates, since fingertips are the
        extremities of the silhouette.
-    3. Hull vertices cluster densely around a curved tip, so candidates
+    3. Candidates whose protrusion is sliced by the image edge are dropped
+       (see below).
+    4. Hull vertices cluster densely around a curved tip, so candidates
        closer together than the merge separation collapse into one, the
        farthest winning.
 
     Because everything is measured from the palm centre outwards, this
     works whether the glove points up, sideways or diagonally — which
     matters for hand-held phone photos.
+
+    **Why step 3 exists.** On a worn glove the bare forearm continues out
+    of frame, and its stump is the farthest hull point of the lot, so it
+    was being reported as a fingertip. That mattered because the tearing
+    detector searches near fingertips: with a tip sitting on the wrist,
+    the exposed forearm — skin, the same thing a tear reveals — became a
+    tear candidate, on undamaged gloves. Measured over the 22-photo set,
+    exactly two candidates were cut by the frame and both were forearms,
+    while all 108 genuine fingertips were untouched.
+
+    Local *width* was tried first and does not work: the forearm is cut
+    off by the frame, so the distance transform reads a small value right
+    at the cut and the stump measures narrower than a real finger.
     """
     center, palm_radius = palm_center_and_radius(seg.mask)
     if palm_radius <= 1:
@@ -245,8 +351,11 @@ def locate_fingertips(seg: SegmentationResult, min_tip_distance_ratio: float,
     for point in hull[:, 0]:
         candidate = (int(point[0]), int(point[1]))
         distance = math.dist(candidate, center)
-        if distance >= min_tip_distance_ratio * palm_radius:
-            candidates.append((distance, candidate))
+        if distance < min_tip_distance_ratio * palm_radius:
+            continue
+        if cut_by_frame(seg.mask, candidate, palm_radius, frame_cut_reach_ratio):
+            continue  # the frame, not the end of a finger
+        candidates.append((distance, candidate))
     candidates.sort(reverse=True)  # farthest first, so real tips win merges
 
     merged: List[Tuple[int, int]] = []
@@ -255,6 +364,34 @@ def locate_fingertips(seg: SegmentationResult, min_tip_distance_ratio: float,
         if all(math.dist(candidate, kept) >= min_separation for kept in merged):
             merged.append(candidate)
     return merged[:max_tips]
+
+
+def fingertip_cross_section(mask: np.ndarray, tip: Tuple[int, int],
+                            center: Tuple[int, int], palm_radius: float,
+                            backoff_ratio: float = 0.30) -> float:
+    """Area of the finger carrying ``tip``, in pixels.
+
+    The distance transform at a point inside a finger is that finger's
+    local half-width, so sampling it a little way back from the tip (the
+    tip itself tapers to nothing) and treating the finger as round gives
+    its cross-section. Measured from the photo, so it needs no assumption
+    about glove size, resolution or camera distance.
+
+    This is the natural scale for anything that happens AT a fingertip. A
+    fraction of the whole glove is not: it makes a threshold depend on how
+    much cuff the glove happens to have.
+    """
+    vector_x, vector_y = center[0] - tip[0], center[1] - tip[1]
+    norm = math.hypot(vector_x, vector_y) or 1.0
+    height, width = mask.shape[:2]
+    sample_x = int(round(tip[0] + vector_x / norm * backoff_ratio * palm_radius))
+    sample_y = int(round(tip[1] + vector_y / norm * backoff_ratio * palm_radius))
+    sample_x = max(0, min(width - 1, sample_x))
+    sample_y = max(0, min(height - 1, sample_y))
+
+    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    half_width = float(distance[sample_y, sample_x])
+    return math.pi * half_width * half_width
 
 
 def is_finger_valley(start: Tuple[int, int], end: Tuple[int, int],

@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -79,11 +80,28 @@ def label_from_filename(path: Path) -> Tuple[Optional[str], Optional[Set[str]]]:
     return material, expected
 
 
-def score_counts(reports: List[Tuple[InspectionReport, Set[str]]],
+@dataclass
+class Scored:
+    """One inspected photo together with the labels read from its name.
+
+    The material travels WITH the report rather than in a list parallel to
+    it. The parallel version could only be indexed safely when the whole
+    set was being scored at once, so `--by-material` had to be switched
+    off entirely whenever `--holdout` split the set — which is exactly
+    when a per-material breakdown is worth having.
+    """
+
+    report: InspectionReport
+    expected: Set[str]
+    material: Optional[str]
+
+
+def score_counts(rows: List[Scored],
                  detector: str) -> Tuple[int, int, int, int]:
     """(true pos, false pos, false neg, true neg) for one detector."""
     tp = fp = fn = tn = 0
-    for report, expected in reports:
+    for report, expected, _ in ((r.report, r.expected, r.material)
+                                for r in rows):
         result = report.results.get(detector)
         fired = bool(result and result.defect_found)
         should = detector in expected
@@ -123,8 +141,7 @@ def main() -> int:
         return 1
 
     inspector = GloveInspector()
-    evaluated: List[Tuple[InspectionReport, Set[str]]] = []
-    materials: List[Optional[str]] = []
+    evaluated: List[Scored] = []
     unlabelled: List[str] = []
 
     for path in images:
@@ -135,8 +152,8 @@ def main() -> int:
         image = cv2.imread(str(path))
         if image is None:
             continue
-        evaluated.append((inspector.inspect(image, path.name), expected))
-        materials.append(material)
+        evaluated.append(
+            Scored(inspector.inspect(image, path.name), expected, material))
 
     if unlabelled:
         print(f"Skipped {len(unlabelled)} file(s) with no defect keyword "
@@ -167,30 +184,39 @@ def main() -> int:
             print(f"{detector:18} {tp:3d} {fp:3d} {fn:3d} {tn:3d}  "
                   f"{ratio(tp, tp + fp):>9} {ratio(tp, tp + fn):>7}")
 
-        if args.by_material and subset is evaluated:
+        if args.by_material:
             print("\n  per material (recall on photos that should show the "
                   "defect; '-' means none were shot)")
-            present = [m for m in MATERIALS if m in materials]
+            seen = {row.material for row in subset}
+            present = [m for m in MATERIALS if m in seen]
             print("    " + f"{'detector':18}" +
                   "".join(f"{m:>12}" for m in present))
             for detector in inspector.detector_names:
                 cells = []
                 for mat in present:
-                    rows = [(r, e) for (r, e), m in zip(subset, materials)
-                            if m == mat]
-                    tp, fp, fn, _ = score_counts(rows, detector)
-                    cells.append(f"{ratio(tp, tp + fn):>9} " if tp + fn
-                                 else f"{'-':>9} ")
-                    cells[-1] = cells[-1].rjust(12)
+                    rows = [row for row in subset if row.material == mat]
+                    tp, _, fn, _ = score_counts(rows, detector)
+                    cells.append(f"{ratio(tp, tp + fn) if tp + fn else '-':>12}")
                 print("    " + f"{detector:18}" + "".join(cells))
 
-        negatives = sum(1 for _, exp in subset if not exp)
+            # A defect photographed on only one material cannot show that
+            # the detector generalises, which is what the brief asks for.
+            # Say so, rather than leaving a row of dashes to be read as a
+            # detector failure when it is really a gap in the photo set.
+            unnamed = sum(1 for row in subset
+                          if row.expected and row.material is None)
+            if unnamed:
+                print(f"    ! {unnamed} defective photo(s) carry no material "
+                      f"in the filename and are missing from every column "
+                      f"above. Name them <defect>_<material>_<n>.jpg.")
+
+        negatives = sum(1 for row in subset if not row.expected)
         if negatives == 0:
             print("\n  ! No undamaged-glove photos in this set. Precision "
                   "above is measured only against OTHER defect types, so it "
                   "overstates how well the system avoids false alarms.")
 
-        flagged = sum(1 for r, _ in subset if r.warnings)
+        flagged = sum(1 for row in subset if row.report.warnings)
         if flagged:
             print(f"  ! {flagged} photo(s) carry a capture warning (part of "
                   f"the glove outside the frame). The warning is advisory "
