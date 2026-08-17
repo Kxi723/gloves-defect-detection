@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+from ctypes import wintypes
 from typing import Dict, Optional
 
 import cv2
@@ -87,16 +88,43 @@ def enable_hidpi() -> float:
         # Windows versions without shcore.
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
+        # Also the path taken when awareness is ALREADY set (the call raises
+        # E_ACCESSDENIED the second time), which is why the scale is read
+        # below regardless of how this turned out. Returning early here left
+        # SCALE at 1.0 and rendered the whole UI at the wrong size.
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
-            return SCALE
-    try:
-        dpi = ctypes.windll.user32.GetDpiForSystem()
-    except Exception:
-        dpi = 96
-    SCALE = max(1.0, dpi / 96.0)
+            pass
+    SCALE = max(1.0, _primary_monitor_dpi() / 96.0)
     return SCALE
+
+
+def _primary_monitor_dpi() -> int:
+    """DPI of the primary monitor, or 96 if it cannot be determined.
+
+    Asked of the MONITOR rather than of the system: with per-monitor
+    scaling, `GetDpiForSystem` reports the session-wide value, which is 96
+    on machines whose displays are individually scaled.
+    """
+    user32 = ctypes.windll.user32
+    try:
+        MONITOR_DEFAULTTOPRIMARY = 1
+        MDT_EFFECTIVE_DPI = 0
+        monitor = user32.MonitorFromPoint(wintypes.POINT(0, 0),
+                                          MONITOR_DEFAULTTOPRIMARY)
+        dpi_x, dpi_y = ctypes.c_uint(), ctypes.c_uint()
+        ctypes.windll.shcore.GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI,
+                                              ctypes.byref(dpi_x),
+                                              ctypes.byref(dpi_y))
+        if dpi_x.value:
+            return dpi_x.value
+    except Exception:
+        pass
+    try:
+        return user32.GetDpiForSystem()
+    except Exception:
+        return 96
 
 
 def apply_scaling(root) -> None:
@@ -121,6 +149,10 @@ def font(size: int = 10, strong: bool = False, mono: bool = False,
 
 _SURFACE_CACHE: Dict[tuple, ImageTk.PhotoImage] = {}
 _SUPERSAMPLE = 4
+# Every distinct width of a stretched button is one more cached image, so a
+# few window drags would otherwise grow this without bound. Dropping the
+# whole cache is fine: entries are rebuilt lazily on the next repaint.
+_CACHE_LIMIT = 400
 
 
 def surface(width: int, height: int, radius: int, fill: Optional[str],
@@ -148,6 +180,8 @@ def surface(width: int, height: int, radius: int, fill: Optional[str],
         width=outline_width * s if outline else 0,
     )
     photo = ImageTk.PhotoImage(image.resize((width, height), _RESAMPLE))
+    if len(_SURFACE_CACHE) >= _CACHE_LIMIT:
+        _SURFACE_CACHE.clear()
     _SURFACE_CACHE[key] = photo
     return photo
 
