@@ -66,12 +66,16 @@ class SegmentationResult:
 # Candidate mask generation
 # --------------------------------------------------------------------------- #
 
-def _estimate_background_lab(lab: np.ndarray, border_fraction: float) -> np.ndarray:
+def estimate_background_lab(lab: np.ndarray, border_fraction: float) -> np.ndarray:
     """Median LAB colour of the image border strip.
 
     The glove is photographed roughly centred, so the border is dominated
     by background. Median (not mean) keeps the estimate stable even when a
     finger crosses one edge.
+
+    Public because detectors need it too: knowing what the backdrop looks
+    like is how ``tearing_at_finger`` tells a view through a tear from a
+    piece of backdrop that segmentation mistakenly swallowed.
     """
     h, w = lab.shape[:2]
     b = max(2, int(round(min(h, w) * border_fraction)))
@@ -93,12 +97,102 @@ def _background_distance_mask(lab: np.ndarray, border_fraction: float) -> np.nda
     different a pixel *looks* from the background — this handles any
     glove/background colour pair without per-colour tuning.
     """
-    background = _estimate_background_lab(lab, border_fraction)
+    background = estimate_background_lab(lab, border_fraction)
     distance = np.linalg.norm(lab.astype(np.float32) - background, axis=2)
     distance_u8 = cv2.normalize(distance, None, 0, 255, cv2.NORM_MINMAX).astype(
         np.uint8
     )
     _, mask = cv2.threshold(distance_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return mask
+
+
+def _flatten_illumination(channel: np.ndarray,
+                          border_fraction: float) -> np.ndarray:
+    """Divide out a quadric illumination model fitted to the border strip.
+
+    Otsu picks ONE global threshold, which is only meaningful when a given
+    material has the same brightness everywhere in frame. Under a lamp or a
+    phone's vignette it does not, so the threshold slices through the
+    background itself and welds a ragged wedge of desk onto the silhouette.
+    Measured on good_latex_4 that wedge inflated the palm radius from 176
+    to 232 px, +32%, and since every detector threshold is a ratio of the
+    palm radius it silently rescaled the whole pipeline.
+
+    The border strip is background by construction (the assumption
+    ``_estimate_background_lab`` already makes), so a surface fitted to it
+    models the lighting without ever sampling the glove. A quadric rather
+    than a plane because vignetting falls off in both axes at once.
+    """
+    h, w = channel.shape[:2]
+    b = max(2, int(round(min(h, w) * border_fraction)))
+    selected = np.zeros((h, w), dtype=bool)
+    selected[:b, :] = True
+    selected[-b:, :] = True
+    selected[:, :b] = True
+    selected[:, -b:] = True
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+
+    def design(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        return np.stack([np.ones_like(x), x, y, x * x, y * y, x * y], axis=1)
+
+    coefficients, *_ = np.linalg.lstsq(
+        design(xx[selected], yy[selected]),
+        channel[selected].astype(np.float32),
+        rcond=None,
+    )
+    model = (design(xx.ravel(), yy.ravel()) @ coefficients).reshape(h, w)
+    model = np.maximum(model, 1.0)      # a near-zero fit would explode below
+    flattened = channel.astype(np.float32) / model * float(np.median(model))
+    return np.clip(flattened, 0, 255).astype(np.uint8)
+
+
+def _background_model_mask(image: np.ndarray,
+                           cfg: SegmentationConfig) -> np.ndarray:
+    """Keep whatever is far from the background's own colour distribution.
+
+    Every other cue asks "does the glove look like itself?", which fails on
+    a latex-coated glove: it is a smooth dark blue coating AND a bright grey
+    knit, and no single threshold holds both. This cue inverts the question.
+    The DESK is the uniform thing, so model it from the border strip and
+    keep what is unlike it. Both materials are unlike the desk, and neither
+    has to resemble the other.
+
+    Each LAB channel is normalised by its own robust spread, with a floor.
+    The floor is not cosmetic: a grey desk has almost no chroma variation,
+    so the raw MAD of a/b comes out near 1.0 and a blue pixel then scores 27
+    sigma. That tail dragged Otsu up to a distance of 17 on good_latex_2
+    while the knit sat at 8.6 and the desk at 3.6, cutting the whole glove
+    away. Differences under a few LAB units are below perceptual noise
+    anyway, so flooring costs nothing real.
+    """
+    border = _flatten_illumination  # (naming the dependency for readers)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab[:, :, 0] = border(lab[:, :, 0], cfg.illumination_border_fraction)
+
+    h, w = image.shape[:2]
+    b = max(2, int(round(min(h, w) * cfg.illumination_border_fraction)))
+    selected = np.zeros((h, w), dtype=bool)
+    selected[:b, :] = True
+    selected[-b:, :] = True
+    selected[:, :b] = True
+    selected[:, -b:] = True
+
+    squared = np.zeros((h, w), dtype=np.float32)
+    for channel in range(3):
+        values = lab[:, :, channel]
+        median = float(np.median(values[selected]))
+        spread = float(np.median(np.abs(values[selected] - median))) * 1.4826
+        spread = max(spread, cfg.background_mad_floor)
+        z = np.minimum(np.abs(values - median) / spread, cfg.background_z_clip)
+        squared += z ** 2
+
+    distance = np.sqrt(squared)
+    scaled = np.clip(
+        distance / (cfg.background_z_clip * np.sqrt(3.0)) * 255.0, 0, 255
+    ).astype(np.uint8)
+    _, mask = cv2.threshold(scaled, 0, 255,
+                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
 
 
@@ -285,11 +379,25 @@ def segment_glove(
         ("texture", _texture_energy_mask(image, cfg.texture_window))
     )
 
-    scored = [(_score_candidate(mask, cfg), name, mask)
-              for name, mask in candidates]
-    best_score, best_cue, best_mask = max(scored, key=lambda triple: triple[0])
-    if best_score < 0:
-        return None  # every cue failed the plausibility checks
+    # The background model is tried FIRST rather than entered into the vote.
+    # The scorer cannot be trusted to pick it: its size term peaks at 0.30
+    # of the frame, so on good_latex_2 a mask that had lost the blue
+    # fingertips (32.3%) outscored the complete silhouette (35.5%), and its
+    # raggedness term penalises a contour for the long perimeter that
+    # correctly resolving five finger gaps necessarily produces. Both terms
+    # prefer a mask that has quietly dropped part of the glove. The vote is
+    # kept as the fallback for photos where the background model itself
+    # fails the plausibility check.
+    primary = _background_model_mask(image, cfg)
+    if _score_candidate(primary, cfg) >= 0:
+        best_cue, best_mask = "bg_model", primary
+    else:
+        scored = [(_score_candidate(mask, cfg), name, mask)
+                  for name, mask in candidates]
+        best_score, best_cue, best_mask = max(scored,
+                                              key=lambda triple: triple[0])
+        if best_score < 0:
+            return None  # every cue failed the plausibility checks
 
     # 2. Morphological cleanup, then isolate the glove blob.
     cleaned = _morphological_cleanup(best_mask, cfg)
