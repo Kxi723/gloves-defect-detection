@@ -36,7 +36,7 @@ from gdd.pipeline import GloveInspector
 from ui import theme
 from ui.theme import px
 from ui.widgets import (Button, Card, ClipLabel, DefectRow, Divider, PhotoTile,
-                        ResultRow, ScrollFrame)
+                        ResultList, ScrollFrame)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -46,6 +46,7 @@ RECOMMENDED_MIN_IMAGES = 1
 
 TILE = 104          # contact-sheet thumbnail edge, before DPI scaling
 TILE_GAP = 10
+ROW_H = 52          # one result row, before DPI scaling
 
 PREVIEW_PLACEHOLDER = "Select a row to view the annotated photo"
 
@@ -135,13 +136,14 @@ class DefectApp:
         self._anchor = 0
 
         self.rows: List[Row] = []
-        self.row_widgets: List[ResultRow] = []
         self.active_row = -1
         self.current_spec: Optional[DefectSpec] = None
 
         self.preview_image: Optional[np.ndarray] = None
         self._preview_photo = None
+        self._preview_key: Optional[tuple] = None
         self._resize_job: Optional[str] = None
+        self._sheet_job: Optional[str] = None
         self._columns = 0
 
         self._queue: "queue.Queue[tuple]" = queue.Queue()
@@ -193,8 +195,12 @@ class DefectApp:
         body = tk.Frame(self.root, bg=theme.APP_BG)
         body.pack(fill="both", expand=True, padx=px(16), pady=(px(14), px(6)))
         body.rowconfigure(0, weight=1)
-        body.columnconfigure(0, weight=0, minsize=px(248))
-        body.columnconfigure(1, weight=3, minsize=px(372))
+        # The defect menu is a fixed list of short labels, so it takes a fixed
+        # narrow column (weight 0) and every extra pixel goes to the two
+        # panels that can use it. The result card is favoured over the contact
+        # sheet because the annotated photo is what gets studied.
+        body.columnconfigure(0, weight=0, minsize=px(232))
+        body.columnconfigure(1, weight=4, minsize=px(372))
         body.columnconfigure(2, weight=5, minsize=px(470))
 
         self._build_defect_card(body)
@@ -270,10 +276,19 @@ class DefectApp:
 
         footer = tk.Frame(card.body, bg=theme.CARD)
         footer.pack(fill="x", padx=px(14), pady=(0, px(14)))
-        self.run_button = Button(footer, "Run detection", self.run_detection,
+        # The button is wrapped in a frame that does not propagate, because a
+        # stretched button paints its rounded background at the granted width
+        # and a Label then REQUESTS the width of its image. That fed straight
+        # back into the grid: the column asked for whatever the button had
+        # just been given, so growing the window pushed the middle column
+        # wider and starved the result card, which stayed at its minimum.
+        holder = tk.Frame(footer, bg=theme.CARD, width=1, height=px(34))
+        holder.pack_propagate(False)
+        holder.pack(fill="x")
+        self.run_button = Button(holder, "Run detection", self.run_detection,
                                  variant="primary", stretch=True, height=34,
                                  size=10)
-        self.run_button.pack(fill="x")
+        self.run_button.pack(fill="both", expand=True)
 
     # ---- card 3: results ---------------------------------------------- #
 
@@ -309,16 +324,12 @@ class DefectApp:
 
         Divider(body, theme.LINE_SOFT).grid(row=1, column=0, sticky="ew")
 
-        self.result_scroll = ScrollFrame(body)
-        self.result_scroll.pack_propagate(False)
-        self.result_scroll.configure(height=px(96))
-        self.result_scroll.grid(row=2, column=0, sticky="nsew",
-                                padx=(px(4), px(4)), pady=px(4))
-        self.result_empty = tk.Label(self.result_scroll.inner,
-                                     text="Results appear here, one row per photo.",
-                                     font=theme.font(9), fg=theme.INK_FAINT,
-                                     bg=theme.CARD)
-        self.result_empty.pack(pady=px(28))
+        self.result_list = ResultList(body, self._select_row, row_height=ROW_H)
+        self.result_list.pack_propagate(False)
+        self.result_list.configure(height=px(96))
+        self.result_list.grid(row=2, column=0, sticky="nsew",
+                              padx=(px(4), px(4)), pady=px(4))
+        self.result_list.clear("Results appear here, one row per photo.")
 
         Divider(body, theme.LINE_SOFT).grid(row=3, column=0, sticky="ew")
 
@@ -484,6 +495,14 @@ class DefectApp:
                       padx=(0, px(TILE_GAP)), pady=(0, px(TILE_GAP)))
 
     def _on_sheet_resize(self, _event=None) -> None:
+        # Re-gridding sixty tiles belongs at the end of a drag, not on every
+        # pixel of it.
+        if self._sheet_job is not None:
+            self.root.after_cancel(self._sheet_job)
+        self._sheet_job = self.root.after(120, self._relayout_sheet)
+
+    def _relayout_sheet(self) -> None:
+        self._sheet_job = None
         self._layout_sheet()
 
     def _on_tile_click(self, index: int, event) -> None:
@@ -625,17 +644,12 @@ class DefectApp:
         self.root.after(50, self._drain_queue)
 
     def _add_row(self, row: Row) -> None:
-        self.result_empty.pack_forget()
         index = len(self.rows)
         self.rows.append(row)
-        widget = ResultRow(self.result_scroll.inner, index, row.name,
-                           row.status, row.score, row.evidence, row.annotated,
-                           self._select_row)
-        widget.pack(fill="x")
-        Divider(self.result_scroll.inner, theme.LINE_SOFT).pack(fill="x")
-        self.row_widgets.append(widget)
-        self.result_scroll.configure(
-            height=min(len(self.rows) * px(53) + px(6), px(340)))
+        self.result_list.append(row.name, row.status, row.score, row.evidence,
+                                row.annotated)
+        self.result_list.configure(
+            height=min(len(self.rows) * px(ROW_H) + px(6), px(340)))
         if index == 0:
             self._select_row(0)
 
@@ -669,13 +683,9 @@ class DefectApp:
         self._set_status(f"Done. {total} photo(s) inspected.")
 
     def _clear_results(self) -> None:
-        for child in self.result_scroll.inner.winfo_children():
-            child.destroy()
-        self.rows, self.row_widgets, self.active_row = [], [], -1
-        self.result_empty = tk.Label(self.result_scroll.inner,
-                                     text="Inspecting…", font=theme.font(9),
-                                     fg=theme.INK_FAINT, bg=theme.CARD)
-        self.result_empty.pack(pady=px(28))
+        self.result_list.clear("Inspecting…")
+        self.result_list.configure(height=px(96))
+        self.rows, self.active_row = [], -1
         self.preview_image = None
         self.preview.configure(image="", text="")
         self._preview_photo = None
@@ -689,8 +699,7 @@ class DefectApp:
         if not 0 <= index < len(self.rows):
             return
         self.active_row = index
-        for position, widget in enumerate(self.row_widgets):
-            widget.set_selected(position == index)
+        self.result_list.select(index)
 
         row = self.rows[index]
         self.preview_image = row.annotated
@@ -707,10 +716,20 @@ class DefectApp:
             # Reached on a cold start too, because the first <Configure> of
             # the stage fires before anything has been inspected.
             self.preview.configure(image="", text=PREVIEW_PLACEHOLDER)
+            self._preview_key = None
             return
-        self.stage.update_idletasks()
+        # Deliberately no update_idletasks() here. Forcing a synchronous
+        # relayout of the whole window from inside a resize callback, while
+        # more <Configure> events are still queued, cost 7.1 of the 11.5
+        # seconds a measured resize sweep took — far more than the drawing
+        # it was meant to prepare for. The debounce below means the geometry
+        # has settled by the time this runs anyway.
         width = max(self.stage.winfo_width() - px(20), px(200))
         height = max(self.stage.winfo_height() - px(20), px(160))
+        key = (self.active_row, width, height)
+        if key == self._preview_key:
+            return
+        self._preview_key = key
         self._preview_photo = theme.photo_rounded(self.preview_image, width,
                                                   height, px(6))
         self.preview.configure(image=self._preview_photo, text="")
