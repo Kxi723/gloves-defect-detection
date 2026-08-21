@@ -337,7 +337,7 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
         defect_type="dirty",
         locations=locations,
         score=min(1.0, stained_fraction / 0.05) if locations else 0.0,
-        details=(f"{len(locations)} dirty region(s), {stained_fraction:.2%} of the glove ({'; '.join(evidence)})" if locations else "no region that is off-colour (z>{cfg.z_threshold:g}) and either texture-free (<{cfg.max_texture_ratio:g}x) or off-hue" + ("" if hue_route_available else "; glove too neutral for the hue test")))
+        details=(f"{len(locations)} dirty region(s), {stained_fraction:.2%} of the glove ({'; '.join(evidence)})" if locations else f"no region that is off-colour (z>{cfg.z_threshold:g}) and either texture-free (<{cfg.max_texture_ratio:g}x) or off-hue" + ("" if hue_route_available else "; glove too neutral for the hue test")))
 
 def detect(image: np.ndarray, segmentation: Optional[SegmentationResult] = None, config: Optional[Config] = None) -> DefectResult:
     cfg = config or Config()
