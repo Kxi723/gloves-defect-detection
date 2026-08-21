@@ -16,7 +16,7 @@ class DefectSpec:
 
 # The order shown in the menu.
 DEFECTS: List[DefectSpec] = [
-    DefectSpec("damage_by_fold", "Damage by Fold - Jason Lai"),
-    DefectSpec("dirty", "Dirty - Jason Lai"),
-    DefectSpec("tearing_at_finger", "Tearing(fingertip) - Jason Lai"),
+    DefectSpec("jason_damage_by_fold", "Damage by Fold - Jason Lai"),
+    DefectSpec("jason_dirty", "Dirty - Jason Lai"),
+    DefectSpec("jason_tearing_at_finger", "Tearing(fingertip) - Jason Lai"),
 ]
