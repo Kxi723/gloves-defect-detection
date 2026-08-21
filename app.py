@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox
 import cv2
 import numpy as np
 from detectors import DEFECTS, DefectSpec
-from gdd.pipeline import GloveInspector
+from runner import GloveInspector
 from ui import theme
 from ui.compare import ComparePage
 from ui.theme import px
@@ -423,7 +423,7 @@ class DefectApp:
         try:
             module = spec.load()
             inspector = GloveInspector(include_builtin_detectors=False)
-            inspector.register_detector(spec.key, module.detect)
+            inspector.register_detector(spec.key, module)
         except Exception:
             self._queue.put(("fatal", token, traceback.format_exc()))
             return
