@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from typing import List
@@ -12,11 +10,9 @@ from .ts_support.features import BBox, DefectResult
 from .ts_support.preprocessing import preprocess, resize_to_limit
 from .ts_support.segmentation import segment_glove
 
-
 def _odd_kernel_size(value: float, minimum: int = 3) -> int:
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
-
 
 def _morphological_skeleton(mask: np.ndarray) -> np.ndarray:
 
@@ -31,13 +27,11 @@ def _morphological_skeleton(mask: np.ndarray) -> np.ndarray:
         work = cv2.erode(work, element)
     return skeleton
 
-
 def _skin_branch_fraction(
     glove_mask: np.ndarray,
     skin_mask: np.ndarray,
     glove_box: BBox,
 ) -> float:
-
 
     glove_x, glove_y, glove_width, glove_height = glove_box
     hand_mask = cv2.bitwise_or(glove_mask, skin_mask)
@@ -76,7 +70,6 @@ def _skin_branch_fraction(
         cv2.bitwise_and(skeleton, skin_neighbourhood)
     )
     return branch_pixels / max(small_size[1], 1)
-
 
 def detect(
     image: np.ndarray,

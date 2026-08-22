@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -10,11 +8,8 @@ import numpy as np
 
 BBox = Tuple[int, int, int, int]
 
-
 @dataclass
 class DefectResult:
-
-
     defect_found: bool
     defect_type: str
     locations: List[BBox] = field(default_factory=list)

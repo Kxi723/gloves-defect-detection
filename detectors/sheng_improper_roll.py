@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import cv2
@@ -14,12 +12,10 @@ from .ts_support.segmentation import (
     segment_glove,
 )
 
-
 def _odd_kernel_size(value: float, minimum: int = 3) -> int:
 
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
-
 
 def _median_local_texture(
     image_bgr: np.ndarray,
@@ -34,7 +30,6 @@ def _median_local_texture(
         np.maximum(local_square_mean - local_mean * local_mean, 0.0)
     )
     return float(np.median(local_texture[glove_selection]))
-
 
 def _skin_pixels_rgb(
     image_bgr: np.ndarray,
@@ -60,7 +55,6 @@ def _skin_pixels_rgb(
         & (((red + green + blue) / 3) < cfg.mean_brightness_max)
     )
     return np.where(skin_pixels, 255, 0).astype(np.uint8)
-
 
 def _largest_component(
     mask: np.ndarray,
@@ -88,7 +82,6 @@ def _largest_component(
     )
     return component, box, best_area
 
-
 def _refine_cotton_segmentation(
     segmentation: SegmentationResult,
     image_bgr: np.ndarray,
@@ -109,7 +102,6 @@ def _refine_cotton_segmentation(
         shortest_side * cfg.cotton_mask_median_fraction,
         minimum=3,
     )
-
 
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     image_height, image_width = rgb.shape[:2]
@@ -205,7 +197,6 @@ def _refine_cotton_segmentation(
         source_image=segmentation.source_image,
     )
 
-
 def _cuff_box(
     glove_box: BBox,
     start_fraction: float,
@@ -222,7 +213,6 @@ def _cuff_box(
         max(1, round(glove_height * height_fraction)), image_height - y
     )
     return x, y, width, height
-
 
 def _cotton_measurements(
     source_image: np.ndarray,
@@ -299,7 +289,6 @@ def _cotton_measurements(
         debug_mask,
     )
 
-
 def _horizontal_fold_edge(
     source_image: np.ndarray,
     segmentation: SegmentationResult,
@@ -361,7 +350,6 @@ def _horizontal_fold_edge(
         edge_pixels, 255, 0
     ).astype(np.uint8)
     return best_score, best_continuity, float(edge_y_fraction), edge_mask
-
 
 def _nitrile_measurements(
     source_image: np.ndarray,
@@ -453,7 +441,6 @@ def _nitrile_measurements(
         float(edge_y_fraction),
         debug_mask,
     )
-
 
 def detect(
     image: np.ndarray,

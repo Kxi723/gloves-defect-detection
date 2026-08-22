@@ -1,5 +1,3 @@
-
-
 from .config import PipelineConfig, get_config
 from .features import BBox, DefectResult
 

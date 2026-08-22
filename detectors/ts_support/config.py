@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -8,14 +6,12 @@ from dataclasses import dataclass, field
 @dataclass
 class PreprocessConfig:
 
-
     max_dimension: int = 1024
     median_kernel: int = 3
 
 
 @dataclass
 class SegmentationConfig:
-
 
     border_fraction: float = 0.04
     min_area_fraction: float = 0.12
@@ -27,7 +23,6 @@ class SegmentationConfig:
 
 @dataclass
 class SkinColourConfig:
-
 
     red_min: int = 85
     green_min: int = 45
@@ -41,7 +36,6 @@ class SkinColourConfig:
 
 @dataclass
 class FingerNotEnoughConfig:
-
 
     cuff_start_fraction: float = 0.84
     contact_kernel_fraction: float = 0.035
@@ -57,7 +51,6 @@ class FingerNotEnoughConfig:
 @dataclass
 class PlasticContaminationConfig:
 
-
     interior_kernel_fraction: float = 0.016
     texture_window_fraction: float = 0.015
     open_kernel_fraction: float = 0.003
@@ -68,14 +61,11 @@ class PlasticContaminationConfig:
     minimum_merge_pixels: int = 2
     score_fraction_scale: float = 0.10
 
-
     finger_end_fraction: float = 0.48
     palm_end_fraction: float = 0.82
 
-
     blue_latex_ratio_threshold: float = 0.42
     knitted_texture_threshold: float = 18.0
-
 
     blue_support_ratio: float = 0.39
     blue_support_red_multiplier: float = 1.12
@@ -83,7 +73,6 @@ class PlasticContaminationConfig:
     blue_support_close_fraction: float = 0.012
     blue_support_padding_pixels: int = 5
     blue_support_min_component_pixels: int = 100
-
 
     latex_finger_saturation_drop: float = 0.110
     latex_finger_intensity_gain: float = 10.0
@@ -100,7 +89,6 @@ class PlasticContaminationConfig:
     latex_max_elongation: float = 2.25
     latex_relative_component_fraction: float = 0.10
 
-
     nitrile_palm_end_fraction: float = 0.88
     nitrile_finger_intensity_gain: float = 20.0
     nitrile_palm_intensity_gain: float = 20.0
@@ -116,19 +104,16 @@ class PlasticContaminationConfig:
 @dataclass
 class ImproperRollConfig:
 
-
     blue_latex_ratio_threshold: float = 0.42
     texture_window_fraction: float = 0.015
     cotton_texture_threshold: float = 18.0
     minimum_analysis_pixels: int = 100
-
 
     cotton_mask_support_dilate_fraction: float = 0.035
     cotton_mask_vertical_close_fraction: float = 0.055
     cotton_mask_compact_close_fraction: float = 0.014
     cotton_mask_median_fraction: float = 0.009
     cotton_colour_min_component_pixels: int = 100
-
 
     cotton_yellow_red_min: int = 115
     cotton_yellow_green_min: int = 85
@@ -144,7 +129,6 @@ class ImproperRollConfig:
     cotton_band_min_area: int = 30
     cotton_score_scale: float = 0.30
 
-
     contact_kernel_fraction: float = 0.055
     skin_min_component_pixels: int = 80
     skin_min_component_fraction: float = 0.002
@@ -152,7 +136,6 @@ class ImproperRollConfig:
     skin_region_x_end_fraction: float = 0.90
     skin_region_y_start_fraction: float = 0.52
     skin_region_y_end_fraction: float = 1.12
-
 
     nitrile_max_aspect: float = 1.35
     nitrile_normal_edge_score: float = 17.0
@@ -175,8 +158,6 @@ class ImproperRollConfig:
 
 @dataclass
 class PipelineConfig:
-
-
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     skin_colour: SkinColourConfig = field(default_factory=SkinColourConfig)
@@ -188,8 +169,5 @@ class PipelineConfig:
     )
     improper_roll: ImproperRollConfig = field(default_factory=ImproperRollConfig)
 
-
 def get_config() -> PipelineConfig:
-
-
     return PipelineConfig()

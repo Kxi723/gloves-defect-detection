@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import cv2
@@ -7,7 +5,6 @@ import numpy as np
 
 
 def _display_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
-
     if mask.ndim == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
     if mask.shape[:2] != (height, width):
@@ -17,7 +14,6 @@ def _display_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
 
 
 def _panel(image: np.ndarray, title: str, width: int, height: int) -> np.ndarray:
-
     if image.shape[:2] != (height, width):
         image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
     header = max(40, round(height * 0.05))

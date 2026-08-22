@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from typing import List
@@ -22,7 +20,6 @@ def _odd_kernel_size(value: float, minimum: int = 3) -> int:
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
 
-
 def _local_texture_ratio(
     image_bgr: np.ndarray,
     selection: np.ndarray,
@@ -39,7 +36,6 @@ def _local_texture_ratio(
     )
     median_texture = max(float(np.median(local_texture[selection])), 1e-6)
     return local_texture / median_texture, median_texture
-
 
 def _keep_regions(
     mask: np.ndarray,
@@ -134,7 +130,6 @@ def _keep_regions(
 
     return kept, locations, total_area
 
-
 def _blue_latex_glove_mask(
     source_image: np.ndarray,
     segmentation: SegmentationResult,
@@ -175,7 +170,6 @@ def _blue_latex_glove_mask(
         blue_mask, cv2.MORPH_CLOSE, close_element, iterations=2
     )
 
-
     count, labels, _, _ = cv2.connectedComponentsWithStats(blue_mask, 8)
     support = np.zeros_like(blue_mask)
     interior_selection = glove_interior > 0
@@ -196,7 +190,6 @@ def _blue_latex_glove_mask(
     largest = max(contours, key=cv2.contourArea)
     cv2.drawContours(detector_mask, [largest], -1, 255, cv2.FILLED)
     return detector_mask
-
 
 def _zone_masks(
     support: np.ndarray,
@@ -224,7 +217,6 @@ def _zone_masks(
     cuff = support > 0
     cuff[:palm_end, :] = False
     return finger, palm, cuff
-
 
 def _zone_reference_candidate(
     zone: np.ndarray,
@@ -266,7 +258,6 @@ def _zone_reference_candidate(
         )
         candidate = candidate | smooth_candidate
     return candidate
-
 
 def detect(
     image: np.ndarray,
@@ -413,7 +404,6 @@ def detect(
             minimum_pixels=cfg.minimum_analysis_pixels,
             intensity_gain=cfg.nitrile_palm_intensity_gain,
         )
-
 
         candidate_pixels = (
             (finger_candidate | palm_candidate)
