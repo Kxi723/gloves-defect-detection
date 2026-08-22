@@ -1,9 +1,4 @@
-"""Render TS detector outputs as one four-stage performance image.
 
-This module only arranges values already produced by a detector. It does
-not run preprocessing, segmentation or defect detection and cannot change a
-label, score, mask or location.
-"""
 
 from __future__ import annotations
 
@@ -12,7 +7,7 @@ import numpy as np
 
 
 def _display_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Return a black-and-white BGR mask at the panel size."""
+
     if mask.ndim == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
     if mask.shape[:2] != (height, width):
@@ -22,7 +17,7 @@ def _display_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
 
 
 def _panel(image: np.ndarray, title: str, width: int, height: int) -> np.ndarray:
-    """Resize one stage and add its title strip."""
+
     if image.shape[:2] != (height, width):
         image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
     header = max(40, round(height * 0.05))
@@ -57,7 +52,7 @@ def build_performance_image(
     status: str,
     score: float,
 ) -> np.ndarray:
-    """Combine Original, two masks and Detected into one horizontal PNG."""
+
     height, width = detected.shape[:2]
     stages = [
         _panel(original, "1. Original", width, height),

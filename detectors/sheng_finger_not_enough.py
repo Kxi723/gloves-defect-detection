@@ -1,44 +1,3 @@
-"""Finger Not Enough detection for the assigned glove photographs.
-
-Defect definition
------------------
-In this prototype, Finger Not Enough is represented by a glove finger that
-ends before the wearer's finger, leaving a connected area of fingertip skin
-visible beyond the glove material.
-
-Detection problem
------------------
-Skin-coloured background objects and small colour variations can resemble an
-exposed fingertip. Wrist skin is also normally visible below the cuff. The
-detector therefore cannot accept every skin-coloured pixel as a defect.
-
-Method
-------
-1. Build an independent glove mask from the raw photograph.
-2. Use an RGB skin-colour threshold to form exposed-skin candidates.
-3. Apply median filtering and morphological opening/closing to remove noise.
-4. Exclude the cuff region and retain only candidates in contact with the
-   glove.
-5. Measure connected components and their exposed area. For a candidate just
-   below the main area threshold, use a morphological skeleton only as
-   supporting evidence that the skin continues a glove-finger centre line.
-
-Decision rule
--------------
-The primary decision is made from connected exposed-skin area relative to the
-glove. Skeleton evidence is used only for the marginal area range; it is not
-the main detector. Accepted components are returned as the defect locations.
-
-Known limitations
------------------
-The implementation detects the visible-skin representation used in the test
-images. It cannot confirm a shortened but closed glove finger when no skin is
-visible. Skin colour, lighting and contact between the skin and glove can also
-affect the result.
-
-Owner: TS. Key decision thresholds and score scales live in
-``PipelineConfig.finger_not_enough`` and ``PipelineConfig.skin_colour``.
-"""
 
 
 from __future__ import annotations
@@ -60,7 +19,7 @@ def _odd_kernel_size(value: float, minimum: int = 3) -> int:
 
 
 def _morphological_skeleton(mask: np.ndarray) -> np.ndarray:
-    """Reduce a binary hand silhouette to one-pixel centre lines."""
+
     work = np.where(mask > 0, 255, 0).astype(np.uint8)
     skeleton = np.zeros_like(work)
     element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
@@ -78,13 +37,8 @@ def _skin_branch_fraction(
     skin_mask: np.ndarray,
     glove_box: BBox,
 ) -> float:
-    """Measure whether exposed skin continues a finger centre line.
 
-    The calculation is performed on a small crop so the iterative
-    morphological skeleton remains fast.  A genuine shortened glove finger
-    produces a centre line that passes from the glove into the connected skin
-    region; isolated skin-coloured noise does not.
-    """
+
     glove_x, glove_y, glove_width, glove_height = glove_box
     hand_mask = cv2.bitwise_or(glove_mask, skin_mask)
     hand_crop = hand_mask[
@@ -128,7 +82,7 @@ def detect(
     image: np.ndarray,
     config: PipelineConfig | None = None,
 ) -> DefectResult:
-    """Run the complete Finger Not Enough workflow on one raw image."""
+
     config = config or get_config()
     source_image = resize_to_limit(image, config.preprocess.max_dimension)
     image = preprocess(image, config.preprocess)
@@ -213,9 +167,7 @@ def detect(
 
     exposed_fraction = exposed_area / max(segmentation.area, 1.0)
 
-    # Area remains the primary decision.  Skeleton evidence is used only for
-    # a marginal region (80-100% of the area threshold), which recovers a
-    # narrow but genuine exposed fingertip without accepting tiny colour noise.
+
     skeleton_branch_fraction = 0.0
     primary_area_pass = (
         exposed_fraction >= cfg.min_exposed_area_fraction

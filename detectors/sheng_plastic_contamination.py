@@ -1,48 +1,4 @@
-"""Plastic Contamination detection on blue Latex and black Nitrile gloves.
 
-Defect definition
------------------
-Plastic Contamination is represented by visible transparent plastic film on
-the photographed glove. The assigned test set uses blue Latex and black
-Nitrile materials.
-
-Detection problem
------------------
-Transparent plastic partly retains the colour of the glove below it. Its most
-useful evidence is therefore a material-dependent combination of colour,
-brightness and local texture rather than one fixed colour. Reflections and
-folds can also split one physical plastic sheet into several image regions.
-
-Method
-------
-1. Build and return an independent glove mask from the raw photograph.
-2. Estimate whether the glove is blue Latex, black Nitrile or light knitted
-   material using blue-channel ratio and local texture. Light knitted gloves
-   are outside this detector's assigned materials.
-3. Erode the mask to obtain the glove interior, divide it into finger and palm
-   zones, and exclude the cuff.
-4. Calculate HSI saturation/intensity and local texture. Compare each zone
-   with its own glove reference so that Latex and Nitrile use material-specific
-   candidate rules.
-5. Apply morphological opening/closing and connected-component shape, area
-   and quality checks to retain plausible plastic regions.
-
-Decision rule
--------------
-Plastic Contamination is reported when at least one connected candidate
-survives the material-specific component checks. The score is based on the
-accepted candidate area relative to the segmented glove area.
-
-Known limitations
------------------
-The defect mask shows pixels that satisfy the visual rules; it is not a ground
-truth outline of the physical plastic. Very transparent, low-contrast or
-strongly folded sections may be only partly detected, while glare can resemble
-plastic. The calibrated material scope is blue Latex and black Nitrile.
-
-Owner: TS. Key decision thresholds and score scales live in
-``PipelineConfig.plastic_contamination``.
-"""
 
 from __future__ import annotations
 
@@ -62,7 +18,7 @@ from .ts_support.segmentation import (
 
 
 def _odd_kernel_size(value: float, minimum: int = 3) -> int:
-    """Round a scale-relative value to a valid odd morphology size."""
+
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
 
@@ -72,7 +28,7 @@ def _local_texture_ratio(
     selection: np.ndarray,
     window_size: int,
 ) -> tuple[np.ndarray, float]:
-    """Local standard deviation divided by the glove's median texture."""
+
     _, intensity = hsi_saturation_and_intensity(image_bgr)
     local_mean = cv2.blur(intensity, (window_size, window_size))
     local_square_mean = cv2.blur(
@@ -95,7 +51,7 @@ def _keep_regions(
     quality_image: np.ndarray | None = None,
     minimum_quality: float | None = None,
 ) -> tuple[np.ndarray, List[BBox], float]:
-    """Keep plausible components, filling only their enclosed small gaps."""
+
     count, labels, statistics, _ = cv2.connectedComponentsWithStats(mask, 8)
     kept = np.zeros_like(mask)
     plausible_components: list[tuple[np.ndarray, BBox, int]] = []
@@ -115,9 +71,7 @@ def _keep_regions(
             if component_quality < minimum_quality:
                 continue
 
-        # Thresholds often leave pinholes where a transparent sheet catches
-        # several different reflections. Fill the external outline of this
-        # already-connected component, but never bridge separate components.
+
         component = np.where(labels == label, 255, 0).astype(np.uint8)
         contours, _ = cv2.findContours(
             component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -132,9 +86,7 @@ def _keep_regions(
             continue
         plausible_components.append((filled, (x, y, width, height), filled_area))
 
-    # Fragments of one transparent sheet can be disconnected because its
-    # middle has the same colour as the glove. Merge components only when
-    # their slightly expanded boxes intersect, then fill their joint hull.
+
     groups: list[tuple[np.ndarray, BBox, int]] = []
     for component, box, area in plausible_components:
         x, y, width, height = box
@@ -189,7 +141,7 @@ def _blue_latex_glove_mask(
     glove_interior: np.ndarray,
     config: PipelineConfig,
 ) -> np.ndarray:
-    """Recover the blue glove silhouette beneath transparent plastic."""
+
     cfg = config.plastic_contamination
     rgb = cv2.cvtColor(source_image, cv2.COLOR_BGR2RGB).astype(np.float32)
     red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
@@ -223,8 +175,7 @@ def _blue_latex_glove_mask(
         blue_mask, cv2.MORPH_CLOSE, close_element, iterations=2
     )
 
-    # Background objects with a similar blue colour are not allowed in:
-    # every retained component must overlap this detector's glove interior.
+
     count, labels, _, _ = cv2.connectedComponentsWithStats(blue_mask, 8)
     support = np.zeros_like(blue_mask)
     interior_selection = glove_interior > 0
@@ -254,7 +205,7 @@ def _zone_masks(
     *,
     palm_end_fraction: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Split detector support into finger, palm and excluded cuff zones."""
+
     cfg = config.plastic_contamination
     _, glove_y, _, glove_height = bbox
     finger_end = glove_y + round(glove_height * cfg.finger_end_fraction)
@@ -288,7 +239,7 @@ def _zone_reference_candidate(
     smooth_intensity_gain: float | None = None,
     smooth_max_saturation: float | None = None,
 ) -> np.ndarray:
-    """Threshold a zone relative to that zone's median surface values."""
+
     if np.count_nonzero(zone) < minimum_pixels:
         return np.zeros_like(zone)
     reference_saturation = float(np.median(saturation[zone]))
@@ -321,7 +272,7 @@ def detect(
     image: np.ndarray,
     config: PipelineConfig | None = None,
 ) -> DefectResult:
-    """Run the complete Plastic Contamination workflow on one raw image."""
+
     config = config or get_config()
     source_image = resize_to_limit(image, config.preprocess.max_dimension)
     image = preprocess(image, config.preprocess)
@@ -438,9 +389,8 @@ def detect(
         minimum_quality = None
         material_name = "blue Latex"
     else:
-        # The photographed Nitrile sheets sit lower on the palm than the
-        # Latex sheets. Rebuild only this detector's zones with a slightly
-        # lower palm boundary; this does not change the Latex branch.
+
+
         finger_zone, palm_zone, _cuff_zone = _zone_masks(
             analysis_support,
             segmentation.bbox,
@@ -463,10 +413,8 @@ def detect(
             minimum_pixels=cfg.minimum_analysis_pixels,
             intensity_gain=cfg.nitrile_palm_intensity_gain,
         )
-        # Transparent film produces local highlights with more variation than
-        # the surrounding smooth Nitrile. Requiring both relative brightness
-        # and local texture prevents ordinary broad lighting changes from
-        # becoming candidates.
+
+
         candidate_pixels = (
             (finger_candidate | palm_candidate)
             & (texture_ratio > cfg.nitrile_min_pixel_texture_ratio)

@@ -1,9 +1,4 @@
-"""Configuration used only by 's three detector-owned workflows.
 
-The dataclasses keep key decision thresholds and score scales outside the
-algorithm functions. The package contains TS-owned preprocessing, segmentation
-and defect settings. It does not configure other group members' detectors.
-"""
 
 from __future__ import annotations
 
@@ -12,7 +7,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class PreprocessConfig:
-    """Image-size and PPT-supported median-filter parameters."""
+
 
     max_dimension: int = 1024
     median_kernel: int = 3
@@ -20,7 +15,7 @@ class PreprocessConfig:
 
 @dataclass
 class SegmentationConfig:
-    """Parameters for selecting and cleaning a plausible glove silhouette."""
+
 
     border_fraction: float = 0.04
     min_area_fraction: float = 0.12
@@ -32,7 +27,7 @@ class SegmentationConfig:
 
 @dataclass
 class SkinColourConfig:
-    """RGB thresholds shared by TS's exposed-skin measurements."""
+
 
     red_min: int = 85
     green_min: int = 45
@@ -46,7 +41,7 @@ class SkinColourConfig:
 
 @dataclass
 class FingerNotEnoughConfig:
-    """RGB, contact and area rules for visible exposed fingertip skin."""
+
 
     cuff_start_fraction: float = 0.84
     contact_kernel_fraction: float = 0.035
@@ -61,7 +56,7 @@ class FingerNotEnoughConfig:
 
 @dataclass
 class PlasticContaminationConfig:
-    """Material-specific zone, HSI, texture and component rules."""
+
 
     interior_kernel_fraction: float = 0.016
     texture_window_fraction: float = 0.015
@@ -73,17 +68,15 @@ class PlasticContaminationConfig:
     minimum_merge_pixels: int = 2
     score_fraction_scale: float = 0.10
 
-    # Finger and palm zones use separate local references; the cuff is not
-    # searched because the photographed plastic samples are on fingers/palm.
+
     finger_end_fraction: float = 0.48
     palm_end_fraction: float = 0.82
 
-    # Material branch selection comes from image statistics, not filenames.
+
     blue_latex_ratio_threshold: float = 0.42
     knitted_texture_threshold: float = 18.0
 
-    # Detector-local support for blue glove pixels weakened by transparent
-    # plastic. These values affect only Plastic Contamination segmentation.
+
     blue_support_ratio: float = 0.39
     blue_support_red_multiplier: float = 1.12
     blue_support_green_multiplier: float = 1.02
@@ -91,7 +84,7 @@ class PlasticContaminationConfig:
     blue_support_padding_pixels: int = 5
     blue_support_min_component_pixels: int = 100
 
-    # Blue Latex finger and palm candidate rules.
+
     latex_finger_saturation_drop: float = 0.110
     latex_finger_intensity_gain: float = 10.0
     latex_finger_max_texture_ratio: float = 0.48
@@ -107,7 +100,7 @@ class PlasticContaminationConfig:
     latex_max_elongation: float = 2.25
     latex_relative_component_fraction: float = 0.10
 
-    # Black Nitrile brightness, texture and component rules.
+
     nitrile_palm_end_fraction: float = 0.88
     nitrile_finger_intensity_gain: float = 20.0
     nitrile_palm_intensity_gain: float = 20.0
@@ -122,22 +115,21 @@ class PlasticContaminationConfig:
 
 @dataclass
 class ImproperRollConfig:
-    """Normal-baseline and fold-evidence rules for Cotton and Nitrile."""
+
 
     blue_latex_ratio_threshold: float = 0.42
     texture_window_fraction: float = 0.015
     cotton_texture_threshold: float = 18.0
     minimum_analysis_pixels: int = 100
 
-    # Cotton-specific silhouette refinement.
+
     cotton_mask_support_dilate_fraction: float = 0.035
     cotton_mask_vertical_close_fraction: float = 0.055
     cotton_mask_compact_close_fraction: float = 0.014
     cotton_mask_median_fraction: float = 0.009
     cotton_colour_min_component_pixels: int = 100
 
-    # Cotton decision: the finished edge must move upward from the stored
-    # Normal position and retain a sufficiently deep, broad fold band.
+
     cotton_yellow_red_min: int = 115
     cotton_yellow_green_min: int = 85
     cotton_yellow_blue_max: int = 115
@@ -152,7 +144,7 @@ class ImproperRollConfig:
     cotton_band_min_area: int = 30
     cotton_score_scale: float = 0.30
 
-    # Nitrile debug evidence near the cuff.
+
     contact_kernel_fraction: float = 0.055
     skin_min_component_pixels: int = 80
     skin_min_component_fraction: float = 0.002
@@ -161,8 +153,7 @@ class ImproperRollConfig:
     skin_region_y_start_fraction: float = 0.52
     skin_region_y_end_fraction: float = 1.12
 
-    # Nitrile decision: shortened glove geometry and a sufficiently strong,
-    # continuous fold edge must both pass their stored Normal-based limits.
+
     nitrile_max_aspect: float = 1.35
     nitrile_normal_edge_score: float = 17.0
     nitrile_min_edge_increase: float = 8.0
@@ -184,7 +175,7 @@ class ImproperRollConfig:
 
 @dataclass
 class PipelineConfig:
-    """Configuration bundle passed through each TS detector."""
+
 
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
@@ -199,6 +190,6 @@ class PipelineConfig:
 
 
 def get_config() -> PipelineConfig:
-    """Return the default configuration for the three TS detectors."""
+
 
     return PipelineConfig()

@@ -1,52 +1,4 @@
-"""Improper Roll detection on Cotton and black Nitrile gloves.
 
-Defect definition
------------------
-Improper Roll is represented by a glove cuff that has been folded or rolled
-upward, shortening the visible cuff and leaving folded glove material near its
-lower edge.
-
-Detection problem
------------------
-Cotton and Nitrile show a roll differently. Cotton has a coloured finished
-edge and visible knitted material below it; black Nitrile has no equivalent
-colour marker, so its decision must use cuff geometry and fold-edge evidence.
-A single colour threshold would therefore not work for both materials.
-
-Method
-------
-1. Build and return an independent glove mask from the raw photograph.
-2. Measure the blue-channel ratio and stop when the image is blue Latex,
-   which is outside this detector's assigned Cotton and Nitrile scope.
-3. Use local texture to choose the Cotton or black Nitrile processing branch.
-4. For Cotton, locate the yellow cuff edge, measure its upward movement from
-   the stored Normal baseline, and check that a sufficiently deep and broad
-   band of folded glove material remains below it.
-5. For Nitrile, compare visible glove height/width with the stored Normal
-   limit and detect a sufficiently strong, continuous fold edge in the cuff
-   zone. Nearby visible skin is recorded as supporting evidence, not as a
-   compulsory condition.
-6. Use RGB thresholding, local standard deviation, morphology, connected
-   components and bounding-box ratios to measure these cues.
-
-Decision rule
--------------
-The Cotton branch requires both upward cuff-edge movement and retained
-fold-band evidence. The Nitrile branch requires both shortened-cuff geometry
-and Normal-relative fold-edge evidence. A cuff-region box is returned only
-when the applicable pair of conditions agrees.
-
-Known limitations
------------------
-The Normal measurements are fixed calibration values in the configuration;
-the program does not request a new Normal reference image at run time. The
-detector is calibrated only for the assigned Cotton and black Nitrile images,
-and it recognises this evidence pattern rather than classifying every possible
-cuff defect or material.
-
-Owner: TS. Key decision thresholds and score scales live in
-``PipelineConfig.improper_roll`` and ``PipelineConfig.skin_colour``.
-"""
 
 from __future__ import annotations
 
@@ -64,7 +16,7 @@ from .ts_support.segmentation import (
 
 
 def _odd_kernel_size(value: float, minimum: int = 3) -> int:
-    """Round a scale-relative value to a valid odd morphology size."""
+
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
 
@@ -74,7 +26,7 @@ def _median_local_texture(
     glove_selection: np.ndarray,
     window_size: int,
 ) -> float:
-    """Median local standard deviation inside the segmented glove."""
+
     grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     local_mean = cv2.blur(grey, (window_size, window_size))
     local_square_mean = cv2.blur(grey * grey, (window_size, window_size))
@@ -88,7 +40,7 @@ def _skin_pixels_rgb(
     image_bgr: np.ndarray,
     cfg: SkinColourConfig,
 ) -> np.ndarray:
-    """Simple RGB skin-colour threshold used only near the glove cuff."""
+
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
     red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
     channel_range = (
@@ -114,7 +66,7 @@ def _largest_component(
     mask: np.ndarray,
     minimum_area: int,
 ) -> tuple[np.ndarray, BBox | None, int]:
-    """Return the largest connected component above ``minimum_area``."""
+
     count, labels, statistics, _ = cv2.connectedComponentsWithStats(mask, 8)
     best_label = 0
     best_area = 0
@@ -142,7 +94,7 @@ def _refine_cotton_segmentation(
     image_bgr: np.ndarray,
     config: PipelineConfig,
 ) -> SegmentationResult:
-    """Combine colour and texture silhouettes, then bridge yarn-row gaps."""
+
     cfg = config.improper_roll
     shortest_side = min(segmentation.mask.shape)
     vertical_size = _odd_kernel_size(
@@ -158,9 +110,7 @@ def _refine_cotton_segmentation(
         minimum=3,
     )
 
-    # The generic selector chooses texture for these knitted gloves. White
-    # yarn can locally resemble the desk, so a separate border-relative RGB
-    # distance mask supplies the parts where texture alone opens the outline.
+
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     image_height, image_width = rgb.shape[:2]
     border_width = max(
@@ -211,9 +161,7 @@ def _refine_cotton_segmentation(
     else:
         colour_solid = np.zeros_like(colour_mask)
 
-    # Colour distance also sees exposed skin. It is only permitted to
-    # repair a narrow neighbourhood around the texture-selected glove, so
-    # the arm below the cuff cannot become part of the glove silhouette.
+
     support_size = _odd_kernel_size(
         shortest_side * cfg.cotton_mask_support_dilate_fraction,
         minimum=5,
@@ -264,7 +212,7 @@ def _cuff_box(
     height_fraction: float,
     image_shape: tuple[int, ...],
 ) -> BBox:
-    """Box the lower cuff region so the UI points at the actual defect."""
+
     glove_x, glove_y, glove_width, glove_height = glove_box
     image_height, image_width = image_shape[:2]
     x = max(0, glove_x)
@@ -281,7 +229,7 @@ def _cotton_measurements(
     segmentation: SegmentationResult,
     config: PipelineConfig,
 ) -> tuple[bool, float, float, float, np.ndarray]:
-    """Measure Cotton cuff shift and material retained below its edge."""
+
     cfg = config.improper_roll
     glove_x, glove_y, glove_width, glove_height = segmentation.bbox
     rgb = cv2.cvtColor(source_image, cv2.COLOR_BGR2RGB).astype(np.int16)
@@ -320,9 +268,7 @@ def _cotton_measurements(
     band_y_fraction = (band_centre_y - glove_y) / max(glove_height, 1)
     band_bottom = band_y + band_height - 1
 
-    # A real roll leaves a visible double layer below the moved cuff edge.
-    # A cut/unfinished cuff can also be short, but it does not leave this
-    # broad retained-material band. This is the second independent cue.
+
     fold_material_mask = np.zeros_like(segmentation.mask)
     fold_material_mask[band_bottom + 1 :, :] = segmentation.mask[
         band_bottom + 1 :, :
@@ -359,7 +305,7 @@ def _horizontal_fold_edge(
     segmentation: SegmentationResult,
     config: PipelineConfig,
 ) -> tuple[float, float, float, np.ndarray]:
-    """Find the strongest continuous horizontal edge in the cuff zone."""
+
     cfg = config.improper_roll
     glove_x, glove_y, glove_width, glove_height = segmentation.bbox
     grey = cv2.cvtColor(source_image, cv2.COLOR_BGR2GRAY)
@@ -422,7 +368,7 @@ def _nitrile_measurements(
     segmentation: SegmentationResult,
     config: PipelineConfig,
 ) -> tuple[bool, float, float, float, float, float, np.ndarray]:
-    """Measure cuff shift from skin plus independent fold-edge evidence."""
+
     cfg = config.improper_roll
     glove_x, glove_y, glove_width, glove_height = segmentation.bbox
 
@@ -489,10 +435,8 @@ def _nitrile_measurements(
     minimum_edge_score = (
         cfg.nitrile_normal_edge_score + cfg.nitrile_min_edge_increase
     )
-    # A roll may cover the wrist completely, so visible skin is supporting
-    # evidence rather than a compulsory condition.  The decision requires two
-    # independent structural cues: the visible glove is shorter than the
-    # Normal reference and a continuous fold edge is present in the cuff zone.
+
+
     shortened_cuff = glove_aspect < cfg.nitrile_max_aspect
     fold_edge_present = (
         edge_score >= minimum_edge_score
@@ -515,7 +459,7 @@ def detect(
     image: np.ndarray,
     config: PipelineConfig | None = None,
 ) -> DefectResult:
-    """Run the complete Improper Roll workflow on one raw image."""
+
     config = config or get_config()
     source_image = resize_to_limit(image, config.preprocess.max_dimension)
     image = preprocess(image, config.preprocess)
