@@ -1,7 +1,7 @@
 from __future__ import annotations
 import time
 from dataclasses import dataclass, field
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List, Optional
 import cv2
 import numpy as np
@@ -88,8 +88,36 @@ class GloveInspector:
                         continue
                     result = module.detect(prepared, segmentation, cfg)
                 else:
-                    prepared, segmentation = None, None
-                    result = module.detect(image)
+                    result = module.detect(image.copy())
+                    prepared, segmentation = image.copy(), None
+                    mask = getattr(result, "analysis_mask", None)
+
+                    if (
+                            isinstance(mask, np.ndarray)
+                            and mask.size > 0
+                            and mask.ndim in (2, 3)
+                        ):
+                        if mask.ndim == 3:
+                            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+
+                        mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+                        contours, _ = cv2.findContours(
+                            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                        )
+
+                        if contours:
+                            contour = max(contours, key=cv2.contourArea)
+                            segmentation = SimpleNamespace(
+                                mask=mask,
+                                mask_raw=mask.copy(),
+                                contour=contour,
+                                cue="detector_owned",
+                            )
+                            prepared = cv2.resize(
+                                image,
+                                (mask.shape[1], mask.shape[0]),
+                                interpolation=cv2.INTER_AREA,
+                            )
                 report.results[name] = result
                 if need_view and segmentation is not None:
                     report.segmentation_ok = True
