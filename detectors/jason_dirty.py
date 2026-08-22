@@ -13,7 +13,6 @@ class PreprocessConfig:
     bilateral_sigma_color: float = 50
     bilateral_sigma_space: float = 50
 
-
 @dataclass
 class SegmentationConfig:
     border_fraction: float = 0.04
@@ -87,7 +86,7 @@ def preprocess(image: np.ndarray, config: Optional[PreprocessConfig] = None) -> 
     cfg = config or PreprocessConfig()
     if image is None or image.size == 0:
         raise ValueError("preprocess() received an empty image")
-    if image.ndim == 2:  # tolerate grayscale input
+    if image.ndim == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     result = resize_to_limit(image, cfg.max_dimension)
     if cfg.white_balance:
@@ -105,47 +104,6 @@ def _background_distance_mask(lab: np.ndarray, border_fraction: float) -> np.nda
     distance = np.linalg.norm(lab.astype(np.float32) - background, axis=2)
     distance_u8 = cv2.normalize(distance, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     _, mask = cv2.threshold(distance_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return mask
-
-def _flatten_illumination(channel: np.ndarray, border_fraction: float) -> np.ndarray:
-    h, w = channel.shape[:2]
-    b = max(2, int(round(min(h, w) * border_fraction)))
-    selected = np.zeros((h, w), dtype=bool)
-    selected[:b, :] = True
-    selected[-b:, :] = True
-    selected[:, :b] = True
-    selected[:, -b:] = True
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    def design(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        return np.stack([np.ones_like(x), x, y, x * x, y * y, x * y], axis=1)
-    coefficients, *_ = np.linalg.lstsq(design(xx[selected], yy[selected]), channel[selected].astype(np.float32), rcond=None,)
-    model = (design(xx.ravel(), yy.ravel()) @ coefficients).reshape(h, w)
-    model = np.maximum(model, 1.0)      # a near-zero fit would explode below
-    flattened = channel.astype(np.float32) / model * float(np.median(model))
-    return np.clip(flattened, 0, 255).astype(np.uint8)
-
-def _background_model_mask(image: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
-    border = _flatten_illumination  # (naming the dependency for readers)
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab[:, :, 0] = border(lab[:, :, 0], cfg.illumination_border_fraction)
-    h, w = image.shape[:2]
-    b = max(2, int(round(min(h, w) * cfg.illumination_border_fraction)))
-    selected = np.zeros((h, w), dtype=bool)
-    selected[:b, :] = True
-    selected[-b:, :] = True
-    selected[:, :b] = True
-    selected[:, -b:] = True
-    squared = np.zeros((h, w), dtype=np.float32)
-    for channel in range(3):
-        values = lab[:, :, channel]
-        median = float(np.median(values[selected]))
-        spread = float(np.median(np.abs(values[selected] - median))) * 1.4826
-        spread = max(spread, cfg.background_mad_floor)
-        z = np.minimum(np.abs(values - median) / spread, cfg.background_z_clip)
-        squared += z ** 2
-    distance = np.sqrt(squared)
-    scaled = np.clip(distance / (cfg.background_z_clip * np.sqrt(3.0)) * 255.0, 0, 255).astype(np.uint8)
-    _, mask = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
 
 def _channel_otsu_masks(hsv: np.ndarray) -> List[np.ndarray]:
@@ -166,6 +124,48 @@ def _texture_energy_mask(image: np.ndarray, window: int) -> np.ndarray:
     std = cv2.GaussianBlur(std, (0, 0), window / 2.0)
     std_u8 = cv2.normalize(std, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     _, mask = cv2.threshold(std_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return mask
+
+def _flatten_illumination(channel: np.ndarray, border_fraction: float) -> np.ndarray:
+    h, w = channel.shape[:2]
+    b = max(2, int(round(min(h, w) * border_fraction)))
+    selected = np.zeros((h, w), dtype=bool)
+    selected[:b, :] = True
+    selected[-b:, :] = True
+    selected[:, :b] = True
+    selected[:, -b:] = True
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+
+    def design(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        return np.stack([np.ones_like(x), x, y, x * x, y * y, x * y], axis=1)
+    
+    coefficients, *_ = np.linalg.lstsq(design(xx[selected], yy[selected]), channel[selected].astype(np.float32), rcond=None,)
+    model = (design(xx.ravel(), yy.ravel()) @ coefficients).reshape(h, w)
+    model = np.maximum(model, 1.0)
+    flattened = channel.astype(np.float32) / model * float(np.median(model))
+    return np.clip(flattened, 0, 255).astype(np.uint8)
+
+def _background_model_mask(image: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab[:, :, 0] = _flatten_illumination(lab[:, :, 0], cfg.illumination_border_fraction)
+    h, w = image.shape[:2]
+    b = max(2, int(round(min(h, w) * cfg.illumination_border_fraction)))
+    selected = np.zeros((h, w), dtype=bool)
+    selected[:b, :] = True
+    selected[-b:, :] = True
+    selected[:, :b] = True
+    selected[:, -b:] = True
+    squared = np.zeros((h, w), dtype=np.float32)
+    for channel in range(3):
+        values = lab[:, :, channel]
+        median = float(np.median(values[selected]))
+        spread = float(np.median(np.abs(values[selected] - median))) * 1.4826
+        spread = max(spread, cfg.background_mad_floor)
+        z = np.minimum(np.abs(values - median) / spread, cfg.background_z_clip)
+        squared += z ** 2
+    distance = np.sqrt(squared)
+    scaled = np.clip(distance / (cfg.background_z_clip * np.sqrt(3.0)) * 255.0, 0, 255).astype(np.uint8)
+    _, mask = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
 
 def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
@@ -260,14 +260,6 @@ def glove_interior(seg: SegmentationResult, margin_ratio: float) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))
     return cv2.erode(seg.mask, kernel)
 
-def interior_depth_map(seg: SegmentationResult) -> Tuple[np.ndarray, float]:
-    _, palm_radius = palm_center_and_radius(seg.mask)
-    depth = cv2.distanceTransform(seg.mask, cv2.DIST_L2, 5)
-    return depth, max(palm_radius, 1e-6)
-
-def region_depth_ratio(depth: np.ndarray, palm_radius: float, members: np.ndarray) -> float:
-    return float(np.median(depth[members])) / palm_radius
-
 def robust_stats(values: np.ndarray) -> Tuple[float, float]:
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
@@ -287,15 +279,10 @@ def median_chroma(chroma: np.ndarray, mask: np.ndarray) -> Tuple[float, float]:
     values = chroma[mask]
     return float(np.median(values[:, 0])), float(np.median(values[:, 1]))
 
-def off_hue_distance(region: Tuple[float, float], reference: Tuple[float, float]) -> float:
-    ref_length = math.hypot(*reference)
-    if ref_length < 1e-6:
-        return math.hypot(*region)
-    unit_a, unit_b = reference[0] / ref_length, reference[1] / ref_length
-    projection = region[0] * unit_a + region[1] * unit_b
-    if projection <= 0.0:
-        return math.hypot(*region)
-    return abs(region[0] * unit_b - region[1] * unit_a)
+def interior_depth_map(seg: SegmentationResult) -> Tuple[np.ndarray, float]:
+    _, palm_radius = palm_center_and_radius(seg.mask)
+    depth = cv2.distanceTransform(seg.mask, cv2.DIST_L2, 5)
+    return depth, max(palm_radius, 1e-6)
 
 def components_as_boxes(mask: np.ndarray, min_area: float, min_extent: float = 0.0) -> List[Tuple[BBox, float, np.ndarray]]:
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
@@ -308,6 +295,19 @@ def components_as_boxes(mask: np.ndarray, min_area: float, min_extent: float = 0
             continue
         results.append(((x, y, width, height), area, labels == i))
     return results
+
+def region_depth_ratio(depth: np.ndarray, palm_radius: float, members: np.ndarray) -> float:
+    return float(np.median(depth[members])) / palm_radius
+
+def off_hue_distance(region: Tuple[float, float], reference: Tuple[float, float]) -> float:
+    ref_length = math.hypot(*reference)
+    if ref_length < 1e-6:
+        return math.hypot(*region)
+    unit_a, unit_b = reference[0] / ref_length, reference[1] / ref_length
+    projection = region[0] * unit_a + region[1] * unit_b
+    if projection <= 0.0:
+        return math.hypot(*region)
+    return abs(region[0] * unit_b - region[1] * unit_a)
 
 def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config) -> DefectResult:
     cfg = config.dirt
@@ -347,12 +347,7 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
         stained_area += area
         evidence.append(f"texture {texture_ratio:.2f}x" if covered else f"hue {off_hue:.0f} off the glove's own")
     stained_fraction = stained_area / segmentation.area
-    return DefectResult(
-        defect_found=bool(locations),
-        defect_type="dirty",
-        locations=locations,
-        score=min(1.0, stained_fraction / 0.05) if locations else 0.0,
-        details=(f"{len(locations)} dirty region(s), {stained_fraction:.2%} of the glove ({'; '.join(evidence)})" if locations else f"no region that is off-colour (z>{cfg.z_threshold:g}) and either texture-free (<{cfg.max_texture_ratio:g}x) or off-hue" + (f"; {shallow} candidate(s) sat too close to the glove edge to be surface dirt" if shallow else "") + ("" if hue_route_available else "; glove too neutral for the hue test")))
+    return DefectResult(defect_found=bool(locations), defect_type="dirty", locations=locations, score=min(1.0, stained_fraction / 0.05) if locations else 0.0, details=(f"{len(locations)} dirty region(s), {stained_fraction:.2%} of the glove ({'; '.join(evidence)})" if locations else f"no region that is off-colour (z>{cfg.z_threshold:g}) and either texture-free (<{cfg.max_texture_ratio:g}x) or off-hue" + (f"; {shallow} candidate(s) sat too close to the glove edge to be surface dirt" if shallow else "") + ("" if hue_route_available else "; glove too neutral for the hue test")))
 
 def detect(image: np.ndarray, segmentation: Optional[SegmentationResult] = None, config: Optional[Config] = None) -> DefectResult:
     cfg = config or Config()

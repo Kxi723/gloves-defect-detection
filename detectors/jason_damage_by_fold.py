@@ -121,6 +121,26 @@ def _background_distance_mask(lab: np.ndarray, border_fraction: float) -> np.nda
     _, mask = cv2.threshold(distance_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
 
+def _channel_otsu_masks(hsv: np.ndarray) -> List[np.ndarray]:
+    masks: List[np.ndarray] = []
+    saturation, value = hsv[:, :, 1], hsv[:, :, 2]
+    _, s_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masks.append(s_mask)
+    _, v_mask = cv2.threshold(value, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masks.append(v_mask)
+    masks.append(cv2.bitwise_not(v_mask))
+    return masks
+
+def _texture_energy_mask(image: np.ndarray, window: int) -> np.ndarray:
+    lightness = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+    mean = cv2.blur(lightness, (window, window))
+    mean_of_squares = cv2.blur(lightness * lightness, (window, window))
+    std = np.sqrt(np.maximum(mean_of_squares - mean * mean, 0.0))
+    std = cv2.GaussianBlur(std, (0, 0), window / 2.0)
+    std_u8 = cv2.normalize(std, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, mask = cv2.threshold(std_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return mask
+
 def _flatten_illumination(channel: np.ndarray, border_fraction: float) -> np.ndarray:
     h, w = channel.shape[:2]
     b = max(2, int(round(min(h, w) * border_fraction)))
@@ -162,26 +182,6 @@ def _background_model_mask(image: np.ndarray, cfg: SegmentationConfig) -> np.nda
     distance = np.sqrt(squared)
     scaled = np.clip(distance / (cfg.background_z_clip * np.sqrt(3.0)) * 255.0, 0, 255).astype(np.uint8)
     _, mask = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return mask
-
-def _channel_otsu_masks(hsv: np.ndarray) -> List[np.ndarray]:
-    masks: List[np.ndarray] = []
-    saturation, value = hsv[:, :, 1], hsv[:, :, 2]
-    _, s_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    masks.append(s_mask)
-    _, v_mask = cv2.threshold(value, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    masks.append(v_mask)
-    masks.append(cv2.bitwise_not(v_mask))
-    return masks
-
-def _texture_energy_mask(image: np.ndarray, window: int) -> np.ndarray:
-    lightness = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
-    mean = cv2.blur(lightness, (window, window))
-    mean_of_squares = cv2.blur(lightness * lightness, (window, window))
-    std = np.sqrt(np.maximum(mean_of_squares - mean * mean, 0.0))
-    std = cv2.GaussianBlur(std, (0, 0), window / 2.0)
-    std_u8 = cv2.normalize(std, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, mask = cv2.threshold(std_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
 
 def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
@@ -276,11 +276,6 @@ def glove_interior(seg: SegmentationResult, margin_ratio: float) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))
     return cv2.erode(seg.mask, kernel)
 
-def robust_stats(values: np.ndarray) -> Tuple[float, float]:
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    return median, max(1.4826 * mad, 1e-6)
-
 def normalize_illumination(image: np.ndarray, clip_limit: float, tile_grid: int) -> np.ndarray:
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
@@ -300,6 +295,100 @@ def fold_ridge_response(image: np.ndarray, interior: np.ndarray, palm_radius: fl
     response = _band_pass(lightness.astype(np.float32), palm_radius, cfg)
     response[interior == 0] = 0.0
     return response
+
+def robust_stats(values: np.ndarray) -> Tuple[float, float]:
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return median, max(1.4826 * mad, 1e-6)
+
+def material_boundary(image: np.ndarray, interior: np.ndarray, palm_radius: float, cfg: FoldConfig) -> np.ndarray:
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    sigma = max(1.0, cfg.material_edge_sigma_ratio * palm_radius)
+    edge = np.zeros(image.shape[:2], np.float32)
+    for channel in (1, 2):
+        blurred = cv2.GaussianBlur(lab[:, :, channel], (0, 0), sigma)
+        gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+        edge += np.hypot(gx, gy)
+    inside = interior > 0
+    if not inside.any():
+        return np.zeros(image.shape[:2], np.uint8)
+    median, spread = robust_stats(edge[inside])
+    band = ((edge > median + cfg.material_edge_z * spread) & inside).astype(np.uint8) * 255
+    size = max(3, int(cfg.material_edge_dilate_ratio * palm_radius)) | 1
+    return cv2.dilate(band, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)))
+
+def _clean(binary: np.ndarray) -> np.ndarray:
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    return cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+def _fragment_pool(binary: np.ndarray, cfg: FoldConfig) -> List[np.ndarray]:
+    contours, _ = cv2.findContours(_clean(binary), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    pool: List[np.ndarray] = []
+    for contour in contours:
+        if len(contour) < 5 or cv2.contourArea(contour) < 30:
+            continue
+        (_, _), (axis_a, axis_b), _ = cv2.fitEllipse(contour)
+        major, minor = max(axis_a, axis_b), max(min(axis_a, axis_b), 1e-6)
+        if major / minor >= cfg.bridge_min_elongation:
+            pool.append(contour)
+    return pool
+
+def _line_like(binary: np.ndarray, min_elongation: float) -> np.ndarray:
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    keep = np.zeros_like(binary)
+    for index in range(1, count):
+        width = stats[index, cv2.CC_STAT_WIDTH]
+        height = stats[index, cv2.CC_STAT_HEIGHT]
+        area = stats[index, cv2.CC_STAT_AREA]
+        if area < 12:
+            continue
+        span = float(np.hypot(width, height))
+        thickness = area / max(span, 1.0)
+        if span / max(thickness, 1e-6) >= min_elongation:
+            keep[labels == index] = 255
+    return keep
+
+def _line_kernel(length: int, angle_degrees: float) -> np.ndarray:
+    kernel = np.zeros((length, length), np.uint8)
+    centre = length // 2
+    radians = np.deg2rad(angle_degrees)
+    for step in np.linspace(-centre, centre, 2 * length):
+        x = int(round(centre + step * np.cos(radians)))
+        y = int(round(centre + step * np.sin(radians)))
+        if 0 <= x < length and 0 <= y < length:
+            kernel[y, x] = 1
+    return kernel
+
+def _bridged_variants(binary: np.ndarray, palm_radius: float, cfg: FoldConfig) -> List[np.ndarray]:
+    seeds = _line_like(binary, cfg.bridge_min_elongation)
+    length = max(5, int(cfg.ridge_bridge_ratio * palm_radius)) | 1
+    variants = [binary]
+    for index in range(cfg.ridge_bridge_angles):
+        angle = 180.0 * index / cfg.ridge_bridge_angles
+        variants.append(cv2.bitwise_or(binary, cv2.morphologyEx(seeds, cv2.MORPH_CLOSE, _line_kernel(length, angle))))
+    return variants
+
+def _shaped_creases(binary: np.ndarray, palm_region: np.ndarray, palm_radius: float, cfg: FoldConfig, bridge: bool = False) -> List[Tuple[np.ndarray, float]]:
+    cleaned = _clean(binary)
+    variants = (_bridged_variants(cleaned, palm_radius, cfg) if bridge else [cleaned])
+    out: List[Tuple[np.ndarray, float]] = []
+    for position, variant in enumerate(variants):
+        minimum = palm_radius * (cfg.min_length_ratio if position == 0 else cfg.bridged_min_length_ratio)
+        contours, _ = cv2.findContours(variant, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            if len(contour) < 5:
+                continue
+            (cx, cy), (axis_a, axis_b), _ = cv2.fitEllipse(contour)
+            major = max(axis_a, axis_b)
+            minor = max(min(axis_a, axis_b), 1e-6)
+            if major < minimum or major / minor < cfg.min_elongation:
+                continue
+            row, col = int(round(cy)), int(round(cx))
+            if not (0 <= row < palm_region.shape[0] and 0 <= col < palm_region.shape[1] and palm_region[row, col]):
+                continue
+            out.append((contour, float(major)))
+    return out
 
 def stripe_deviation(image: np.ndarray, interior: np.ndarray, palm_radius: float, cfg: FoldConfig) -> np.ndarray:
     equalized = normalize_illumination(image, cfg.clahe_clip_limit, cfg.clahe_tile_grid)
@@ -339,78 +428,14 @@ def chroma_residual(image: np.ndarray, interior: np.ndarray, palm_radius: float,
     residual[inside] = lightness[inside] - design @ coefficients
     return residual
 
-def _clean(binary: np.ndarray) -> np.ndarray:
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
-    return cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-
-def _line_kernel(length: int, angle_degrees: float) -> np.ndarray:
-    kernel = np.zeros((length, length), np.uint8)
-    centre = length // 2
-    radians = np.deg2rad(angle_degrees)
-    for step in np.linspace(-centre, centre, 2 * length):
-        x = int(round(centre + step * np.cos(radians)))
-        y = int(round(centre + step * np.sin(radians)))
-        if 0 <= x < length and 0 <= y < length:
-            kernel[y, x] = 1
-    return kernel
-
-def _line_like(binary: np.ndarray, min_elongation: float) -> np.ndarray:
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-    keep = np.zeros_like(binary)
-    for index in range(1, count):
-        width = stats[index, cv2.CC_STAT_WIDTH]
-        height = stats[index, cv2.CC_STAT_HEIGHT]
-        area = stats[index, cv2.CC_STAT_AREA]
-        if area < 12:
-            continue
-        span = float(np.hypot(width, height))
-        thickness = area / max(span, 1.0)
-        if span / max(thickness, 1e-6) >= min_elongation:
-            keep[labels == index] = 255
-    return keep
-
-def _bridged_variants(binary: np.ndarray, palm_radius: float, cfg: FoldConfig) -> List[np.ndarray]:
-    seeds = _line_like(binary, cfg.bridge_min_elongation)
-    length = max(5, int(cfg.ridge_bridge_ratio * palm_radius)) | 1
-    variants = [binary]
-    for index in range(cfg.ridge_bridge_angles):
-        angle = 180.0 * index / cfg.ridge_bridge_angles
-        variants.append(cv2.bitwise_or(binary, cv2.morphologyEx(seeds, cv2.MORPH_CLOSE, _line_kernel(length, angle))))
-    return variants
-
-
-def _shaped_creases(binary: np.ndarray, palm_region: np.ndarray, palm_radius: float, cfg: FoldConfig, bridge: bool = False) -> List[Tuple[np.ndarray, float]]:
-    cleaned = _clean(binary)
-    variants = (_bridged_variants(cleaned, palm_radius, cfg) if bridge else [cleaned])
-    out: List[Tuple[np.ndarray, float]] = []
-    for position, variant in enumerate(variants):
-        minimum = palm_radius * (cfg.min_length_ratio if position == 0 else cfg.bridged_min_length_ratio)
-        contours, _ = cv2.findContours(variant, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            if len(contour) < 5:
-                continue
-            (cx, cy), (axis_a, axis_b), _ = cv2.fitEllipse(contour)
-            major = max(axis_a, axis_b)
-            minor = max(min(axis_a, axis_b), 1e-6)
-            if major < minimum or major / minor < cfg.min_elongation:
-                continue
-            row, col = int(round(cy)), int(round(cx))
-            if not (0 <= row < palm_region.shape[0] and 0 <= col < palm_region.shape[1] and palm_region[row, col]):
-                continue
-            out.append((contour, float(major)))
-    return out
-
-def _fragment_pool(binary: np.ndarray, cfg: FoldConfig) -> List[np.ndarray]:
-    contours, _ = cv2.findContours(_clean(binary), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    pool: List[np.ndarray] = []
-    for contour in contours:
-        if len(contour) < 5 or cv2.contourArea(contour) < 30:
-            continue
-        (_, _), (axis_a, axis_b), _ = cv2.fitEllipse(contour)
-        major, minor = max(axis_a, axis_b), max(min(axis_a, axis_b), 1e-6)
-        if major / minor >= cfg.bridge_min_elongation:
-            pool.append(contour)
-    return pool
+def _is_shadow(contour: np.ndarray, lightness: np.ndarray, glove_median: float, cfg: FoldConfig) -> Tuple[bool, float]:
+    stencil = np.zeros(lightness.shape, np.uint8)
+    cv2.drawContours(stencil, [contour], -1, 255, thickness=cv2.FILLED)
+    inside = stencil > 0
+    if not inside.any():
+        return False, 0.0
+    delta = float(np.median(lightness[inside])) - glove_median
+    return delta <= cfg.max_lightness_delta, delta
 
 def _axis_of(contour: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
     (cx, cy), (axis_a, axis_b), angle = cv2.fitEllipse(contour)
@@ -444,40 +469,12 @@ def _extend_along_line(contour: np.ndarray, pool: List[np.ndarray], palm_radius:
     extent = float(along.max() - along.min())
     return cv2.boundingRect(points.astype(np.int32)), max(extent, length)
 
-def _is_shadow(contour: np.ndarray, lightness: np.ndarray, glove_median: float, cfg: FoldConfig) -> Tuple[bool, float]:
-    stencil = np.zeros(lightness.shape, np.uint8)
-    cv2.drawContours(stencil, [contour], -1, 255, thickness=cv2.FILLED)
-    inside = stencil > 0
-    if not inside.any():
-        return False, 0.0
-    delta = float(np.median(lightness[inside])) - glove_median
-    return delta <= cfg.max_lightness_delta, delta
-
-def material_boundary(image: np.ndarray, interior: np.ndarray, palm_radius: float, cfg: FoldConfig) -> np.ndarray:
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
-    sigma = max(1.0, cfg.material_edge_sigma_ratio * palm_radius)
-    edge = np.zeros(image.shape[:2], np.float32)
-    for channel in (1, 2):
-        blurred = cv2.GaussianBlur(lab[:, :, channel], (0, 0), sigma)
-        gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
-        edge += np.hypot(gx, gy)
-    inside = interior > 0
-    if not inside.any():
-        return np.zeros(image.shape[:2], np.uint8)
-    median, spread = robust_stats(edge[inside])
-    band = ((edge > median + cfg.material_edge_z * spread) & inside).astype(np.uint8) * 255
-    size = max(3, int(cfg.material_edge_dilate_ratio * palm_radius)) | 1
-    return cv2.dilate(band, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)))
-
-
 def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config) -> DefectResult:
     cfg = config.fold
     interior = glove_interior(segmentation, cfg.interior_margin_ratio)
     palm_center, palm_radius = palm_center_and_radius(segmentation.mask)
     if np.count_nonzero(interior) < 100 or palm_radius < 10:
         return DefectResult(False, "damage_by_fold", details="glove interior too small to analyse")
-
     palm_disc = np.zeros_like(interior)
     cv2.circle(palm_disc, palm_center, int(cfg.palm_radius_ratio * palm_radius), 255, cv2.FILLED)
     palm_region = cv2.bitwise_and(interior, palm_disc)
@@ -490,8 +487,7 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
     response = fold_ridge_response(image, interior, palm_radius, cfg)
     _, spread = robust_stats(response[interior > 0])
     ridge = ((np.abs(response) > cfg.z_threshold * spread) & (palm_region > 0)).astype(np.uint8) * 255
-    ridge = cv2.bitwise_and(ridge, cv2.bitwise_not(
-        material_boundary(image, interior, palm_radius, cfg)))
+    ridge = cv2.bitwise_and(ridge, cv2.bitwise_not(material_boundary(image, interior, palm_radius, cfg)))
     pools["shading"] = _fragment_pool(ridge, cfg)
     for contour, major in _shaped_creases(ridge, palm_region, palm_radius, cfg, bridge=True):
         candidates.append((contour, major, "shading"))
@@ -548,4 +544,3 @@ def detect(image: np.ndarray, segmentation: Optional[SegmentationResult] = None,
         if segmentation is None:
             return DefectResult(False, "damage_by_fold", details="the glove could not be separated from the background")
     return _analyse(image, segmentation, cfg)
-

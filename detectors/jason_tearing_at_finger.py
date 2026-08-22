@@ -183,6 +183,22 @@ def _background_model_mask(image: np.ndarray, cfg: SegmentationConfig) -> np.nda
     _, mask = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
 
+def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel))
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel))
+    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_k)
+    return cleaned
+
+def _keep_largest_component(mask: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return np.zeros_like(mask), None
+    largest = max(contours, key=cv2.contourArea)
+    solid = np.zeros_like(mask)
+    cv2.drawContours(solid, [largest], -1, 255, thickness=cv2.FILLED)
+    return solid, largest
+
 def _score_candidate(mask: np.ndarray, cfg: SegmentationConfig) -> float:
     image_area = float(mask.shape[0] * mask.shape[1])
     cleaned = _morphological_cleanup(mask, cfg)
@@ -204,22 +220,6 @@ def _score_candidate(mask: np.ndarray, cfg: SegmentationConfig) -> float:
     hull_perimeter = max(cv2.arcLength(cv2.convexHull(contour), True), 1.0)
     raggedness = cv2.arcLength(contour, True) / hull_perimeter
     return ((1.0 - border_occupancy) * 2.0 + (1.0 - abs(area_fraction - 0.30)) - 4.0 * min(shred, 0.5) - 0.5 * max(0.0, raggedness - 1.6))
-
-def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
-    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel))
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel))
-    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_k)
-    return cleaned
-
-def _keep_largest_component(mask: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        return np.zeros_like(mask), None
-    largest = max(contours, key=cv2.contourArea)
-    solid = np.zeros_like(mask)
-    cv2.drawContours(solid, [largest], -1, 255, thickness=cv2.FILLED)
-    return solid, largest
 
 def _fill_noise_holes(mask_raw: np.ndarray, solid: np.ndarray, cfg: SegmentationConfig, glove_area: float) -> np.ndarray:
     holes = cv2.subtract(solid, mask_raw)
