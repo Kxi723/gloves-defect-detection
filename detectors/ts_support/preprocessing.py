@@ -1,10 +1,3 @@
-"""PPT-supported preprocessing used by TS's three detector workflows.
-
-The input is resized for bounded processing cost and denoised with a small
-median filter. The detector then measures colours relative to the current
-image instead of applying separate global colour correction.
-"""
-
 from __future__ import annotations
 
 from typing import Optional
@@ -16,7 +9,7 @@ from .config import PreprocessConfig
 
 
 def resize_to_limit(image: np.ndarray, max_dimension: int) -> np.ndarray:
-    """Downscale the longest side to ``max_dimension`` without upscaling."""
+
     height, width = image.shape[:2]
     longest = max(height, width)
     if longest <= max_dimension:
@@ -29,7 +22,7 @@ def resize_to_limit(image: np.ndarray, max_dimension: int) -> np.ndarray:
 def preprocess(
     image: np.ndarray, config: Optional[PreprocessConfig] = None
 ) -> np.ndarray:
-    """Resize and median-filter one BGR image."""
+
     cfg = config or PreprocessConfig()
     if image is None or image.size == 0:
         raise ValueError("preprocess() received an empty image")
