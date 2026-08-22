@@ -5,12 +5,12 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-# @dataclass
-# class PreprocessConfig:
-#     max_dimension: int = 1024
-#     bilateral_diameter: int = 7
-#     bilateral_sigma_color: float = 50
-#     bilateral_sigma_space: float = 50
+@dataclass
+class PreprocessConfig:
+    max_dimension: int = 1024
+    bilateral_diameter: int = 7
+    bilateral_sigma_color: float = 50
+    bilateral_sigma_space: float = 50
 
 @dataclass
 class SegmentationConfig:
@@ -55,7 +55,7 @@ class FingertipConfig:
 
 @dataclass
 class Config:
-    # preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
+    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     tearing: TearingConfig = field(default_factory=TearingConfig)
     fingertip: FingertipConfig = field(default_factory=FingertipConfig)
@@ -100,12 +100,13 @@ def gray_world_white_balance(image: np.ndarray) -> np.ndarray:
     balanced = img * gains.reshape(1, 1, 3)
     return np.clip(balanced, 0, 255).astype(np.uint8)
 
-def preprocess(image: np.ndarray) -> np.ndarray:
+def preprocess(image: np.ndarray, config: Optional[PreprocessConfig] = None) -> np.ndarray:
+    cfg = config or PreprocessConfig()
     if image is None or image.size == 0:
         raise ValueError("preprocess() received an empty image")
-    result = resize_to_limit(image, 1024)
+    result = resize_to_limit(image, cfg.max_dimension)
     result = gray_world_white_balance(result)
-    return cv2.bilateralFilter(result, d=7, sigmaColor=50, sigmaSpace=50)
+    return cv2.bilateralFilter(result, d=cfg.bilateral_diameter, sigmaColor=cfg.bilateral_sigma_color, sigmaSpace=cfg.bilateral_sigma_space)
 
 def estimate_background_lab(lab: np.ndarray, border_fraction: float) -> np.ndarray:
     h, w = lab.shape[:2]
@@ -135,12 +136,12 @@ def _flatten_illumination(channel: np.ndarray, border_fraction: float) -> np.nda
     
     coefficients, *_ = np.linalg.lstsq(design(xx[selected], yy[selected]), channel[selected].astype(np.float32), rcond=None)
     model = (design(xx.ravel(), yy.ravel()) @ coefficients).reshape(h, w)
-    model = np.maximum(model, 1.0)      # a near-zero fit would explode below
+    model = np.maximum(model, 1.0)
     flattened = channel.astype(np.float32) / model * float(np.median(model))
     return np.clip(flattened, 0, 255).astype(np.uint8)
 
 def _background_model_mask(image: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
-    border = _flatten_illumination  # (naming the dependency for readers)
+    border = _flatten_illumination
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab[:, :, 0] = border(lab[:, :, 0], cfg.illumination_border_fraction)
     h, w = image.shape[:2]
@@ -234,9 +235,9 @@ def _fill_noise_holes(mask_raw: np.ndarray, solid: np.ndarray, cfg: Segmentation
 
 def segment_glove(image: np.ndarray, config: Optional[SegmentationConfig] = None) -> Optional[SegmentationResult]:
     cfg = config or SegmentationConfig()
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    img = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    candidates: List[Tuple[str, np.ndarray]] = [("bg_distance", _background_distance_mask(lab, cfg.border_fraction))]
+    candidates: List[Tuple[str, np.ndarray]] = [("bg_distance", _background_distance_mask(img, 0.04))]
     otsu_masks = _channel_otsu_masks(hsv)
     candidates.append(("saturation", otsu_masks[0]))
     candidates.append(("value", otsu_masks[1]))
@@ -580,7 +581,7 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
 def detect(image: np.ndarray, segmentation: Optional[SegmentationResult] = None, config: Optional[Config] = None) -> DefectResult:
     cfg = config or Config()
     if segmentation is None:
-        image = preprocess(image)
+        image = preprocess(image, cfg.preprocess)
         segmentation = segment_glove(image, cfg.segmentation)
         if segmentation is None:
             return DefectResult(False, "tearing_at_finger", details="the glove could not be separated from the background")
