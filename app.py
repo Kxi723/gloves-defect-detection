@@ -78,6 +78,8 @@ class Row:
     annotated: Optional[np.ndarray] = None
     warnings: List[str] = field(default_factory=list)
     path: Optional[Path] = None
+    glove_mask: Optional[np.ndarray] = None
+    defect_mask: Optional[np.ndarray] = None
 
 
 class DefectApp:
@@ -447,6 +449,9 @@ class DefectApp:
             else:
                 status = "MATCH" if result.defect_found else "NO MATCH"
                 row = Row(name=path.name, status=status, score=result.score, evidence=result.details, annotated=annotated, warnings=report.warnings, path=path)
+            if result is not None:
+                row.glove_mask = getattr(result, "analysis_mask", None)
+                row.defect_mask = getattr(result, "debug_mask", None)
             self._queue.put(("row", token, row))
         self._queue.put(("done", token, spec))
 
@@ -612,11 +617,17 @@ class DefectApp:
         if row.annotated is None or original is None:
             self._set_status("There is no pair to save for this photo.")
             return
-        target = filedialog.asksaveasfilename(title="Save this comparison", defaultextension=".png", initialdir=str(self._save_dir), initialfile=f"{Path(row.name).stem}_compare.png", filetypes=[("PNG image", "*.png")])
+        has_stages = row.glove_mask is not None and row.defect_mask is not None
+        suffix = "performance" if has_stages else "compare"
+        target = filedialog.asksaveasfilename(title="Save this comparison", defaultextension=".png", initialdir=str(self._save_dir), initialfile=f"{Path(row.name).stem}_{suffix}.png", filetypes=[("PNG image", "*.png")])
         if not target:
             return
         self._save_dir = Path(target).parent
-        combined = side_by_side(original, row.annotated, row.name)
+        if has_stages:
+            from detectors.ts_support.performance_export import build_performance_image
+            combined = build_performance_image(original, row.glove_mask, row.defect_mask, row.annotated, row.name, row.status, row.score)
+        else:
+            combined = side_by_side(original, row.annotated, row.name)
         if imwrite_unicode(Path(target), combined):
             self._set_status(f"Saved the comparison to {target}")
         else:
