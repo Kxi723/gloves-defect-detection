@@ -124,6 +124,7 @@ class PlasticContaminationConfig:
 class ImproperRollConfig:
     """Normal-baseline and fold-evidence rules for Cotton and Nitrile."""
 
+    blue_latex_ratio_threshold: float = 0.42
     texture_window_fraction: float = 0.015
     cotton_texture_threshold: float = 18.0
     minimum_analysis_pixels: int = 100

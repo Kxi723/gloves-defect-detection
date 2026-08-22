@@ -16,15 +16,17 @@ A single colour threshold would therefore not work for both materials.
 Method
 ------
 1. Build and return an independent glove mask from the raw photograph.
-2. Use local texture to choose the Cotton or black Nitrile processing branch.
-3. For Cotton, locate the yellow cuff edge, measure its upward movement from
+2. Measure the blue-channel ratio and stop when the image is blue Latex,
+   which is outside this detector's assigned Cotton and Nitrile scope.
+3. Use local texture to choose the Cotton or black Nitrile processing branch.
+4. For Cotton, locate the yellow cuff edge, measure its upward movement from
    the stored Normal baseline, and check that a sufficiently deep and broad
    band of folded glove material remains below it.
-4. For Nitrile, compare visible glove height/width with the stored Normal
+5. For Nitrile, compare visible glove height/width with the stored Normal
    limit and detect a sufficiently strong, continuous fold edge in the cuff
    zone. Nearby visible skin is recorded as supporting evidence, not as a
    compulsory condition.
-5. Use RGB thresholding, local standard deviation, morphology, connected
+6. Use RGB thresholding, local standard deviation, morphology, connected
    components and bounding-box ratios to measure these cues.
 
 Decision rule
@@ -535,6 +537,22 @@ def detect(
             False,
             "improper_roll",
             details="segmented glove too small to analyse",
+            debug_mask=np.zeros_like(segmentation.mask),
+            analysis_mask=segmentation.mask,
+        )
+
+    rgb = cv2.cvtColor(source_image, cv2.COLOR_BGR2RGB).astype(np.float32)
+    rgb_sum = np.maximum(rgb.sum(axis=2), 1.0)
+    blue_ratio = rgb[:, :, 2] / rgb_sum
+    median_blue_ratio = float(np.median(blue_ratio[glove_selection]))
+    if median_blue_ratio >= cfg.blue_latex_ratio_threshold:
+        return DefectResult(
+            False,
+            "improper_roll",
+            details=(
+                "blue Latex is outside the assigned Improper Roll material "
+                "scope; use Cotton or black Nitrile"
+            ),
             debug_mask=np.zeros_like(segmentation.mask),
             analysis_mask=segmentation.mask,
         )
