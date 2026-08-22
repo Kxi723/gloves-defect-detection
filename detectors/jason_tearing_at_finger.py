@@ -121,6 +121,26 @@ def _background_distance_mask(lab: np.ndarray, border_fraction: float) -> np.nda
     _, mask = cv2.threshold(distance_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
 
+def _channel_otsu_masks(hsv: np.ndarray) -> List[np.ndarray]:
+    masks: List[np.ndarray] = []
+    saturation, value = hsv[:, :, 1], hsv[:, :, 2]
+    _, s_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masks.append(s_mask)
+    _, v_mask = cv2.threshold(value, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masks.append(v_mask)
+    masks.append(cv2.bitwise_not(v_mask))
+    return masks
+
+def _texture_energy_mask(image: np.ndarray, window: int) -> np.ndarray:
+    lightness = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+    mean = cv2.blur(lightness, (window, window))
+    mean_of_squares = cv2.blur(lightness * lightness, (window, window))
+    std = np.sqrt(np.maximum(mean_of_squares - mean * mean, 0.0))
+    std = cv2.GaussianBlur(std, (0, 0), window / 2.0)
+    std_u8 = cv2.normalize(std, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, mask = cv2.threshold(std_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return mask
+
 def _flatten_illumination(channel: np.ndarray, border_fraction: float) -> np.ndarray:
     h, w = channel.shape[:2]
     b = max(2, int(round(min(h, w) * border_fraction)))
@@ -141,9 +161,8 @@ def _flatten_illumination(channel: np.ndarray, border_fraction: float) -> np.nda
     return np.clip(flattened, 0, 255).astype(np.uint8)
 
 def _background_model_mask(image: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
-    border = _flatten_illumination
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab[:, :, 0] = border(lab[:, :, 0], cfg.illumination_border_fraction)
+    lab[:, :, 0] = _flatten_illumination(lab[:, :, 0], cfg.illumination_border_fraction)
     h, w = image.shape[:2]
     b = max(2, int(round(min(h, w) * cfg.illumination_border_fraction)))
     selected = np.zeros((h, w), dtype=bool)
@@ -163,43 +182,6 @@ def _background_model_mask(image: np.ndarray, cfg: SegmentationConfig) -> np.nda
     scaled = np.clip(distance / (cfg.background_z_clip * np.sqrt(3.0)) * 255.0, 0, 255).astype(np.uint8)
     _, mask = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
-
-def _channel_otsu_masks(hsv: np.ndarray) -> List[np.ndarray]:
-    masks: List[np.ndarray] = []
-    saturation, value = hsv[:, :, 1], hsv[:, :, 2]
-    _, s_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    masks.append(s_mask)
-    _, v_mask = cv2.threshold(value, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    masks.append(v_mask)
-    masks.append(cv2.bitwise_not(v_mask))
-    return masks
-
-def _texture_energy_mask(image: np.ndarray, window: int) -> np.ndarray:
-    lightness = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
-    mean = cv2.blur(lightness, (window, window))
-    mean_of_squares = cv2.blur(lightness * lightness, (window, window))
-    # Var(X) = E[X^2] - E[X]^2; clamped because rounding can make it < 0.
-    std = np.sqrt(np.maximum(mean_of_squares - mean * mean, 0.0))
-    std = cv2.GaussianBlur(std, (0, 0), window / 2.0)
-    std_u8 = cv2.normalize(std, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, mask = cv2.threshold(std_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return mask
-
-def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
-    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel))
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel))
-    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_k)
-    return cleaned
-
-def _keep_largest_component(mask: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        return np.zeros_like(mask), None
-    largest = max(contours, key=cv2.contourArea)
-    solid = np.zeros_like(mask)
-    cv2.drawContours(solid, [largest], -1, 255, thickness=cv2.FILLED)
-    return solid, largest
 
 def _score_candidate(mask: np.ndarray, cfg: SegmentationConfig) -> float:
     image_area = float(mask.shape[0] * mask.shape[1])
@@ -223,6 +205,22 @@ def _score_candidate(mask: np.ndarray, cfg: SegmentationConfig) -> float:
     raggedness = cv2.arcLength(contour, True) / hull_perimeter
     return ((1.0 - border_occupancy) * 2.0 + (1.0 - abs(area_fraction - 0.30)) - 4.0 * min(shred, 0.5) - 0.5 * max(0.0, raggedness - 1.6))
 
+def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel))
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel))
+    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_k)
+    return cleaned
+
+def _keep_largest_component(mask: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return np.zeros_like(mask), None
+    largest = max(contours, key=cv2.contourArea)
+    solid = np.zeros_like(mask)
+    cv2.drawContours(solid, [largest], -1, 255, thickness=cv2.FILLED)
+    return solid, largest
+
 def _fill_noise_holes(mask_raw: np.ndarray, solid: np.ndarray, cfg: SegmentationConfig, glove_area: float) -> np.ndarray:
     holes = cv2.subtract(solid, mask_raw)
     hole_contours, _ = cv2.findContours(holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -237,7 +235,7 @@ def segment_glove(image: np.ndarray, config: Optional[SegmentationConfig] = None
     cfg = config or SegmentationConfig()
     img = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    candidates: List[Tuple[str, np.ndarray]] = [("bg_distance", _background_distance_mask(img, 0.04))]
+    candidates: List[Tuple[str, np.ndarray]] = [("bg_distance", _background_distance_mask(img, cfg.border_fraction))]
     otsu_masks = _channel_otsu_masks(hsv)
     candidates.append(("saturation", otsu_masks[0]))
     candidates.append(("value", otsu_masks[1]))
@@ -270,117 +268,6 @@ def palm_center_and_radius(mask: np.ndarray) -> Tuple[Tuple[int, int], float]:
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     _, max_val, _, max_loc = cv2.minMaxLoc(dist)
     return (int(max_loc[0]), int(max_loc[1])), float(max_val)
-
-def glove_interior(seg: SegmentationResult, margin_ratio: float) -> np.ndarray:
-    _, palm_radius = palm_center_and_radius(seg.mask)
-    margin = max(3, int(margin_ratio * palm_radius))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))
-    return cv2.erode(seg.mask, kernel)
-
-def robust_stats(values: np.ndarray) -> Tuple[float, float]:
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    return median, max(1.4826 * mad, 1e-6)
-
-def _clip01(value: float) -> float:
-    return float(min(1.0, max(0.0, value)))
-
-def _colour_margin(z_median: float, z_gate: float) -> float:
-    return _clip01(z_median / max(z_gate, 1e-6) - 1.0)
-
-def _backdrop_margin(patch: np.ndarray, backdrop: np.ndarray, glove: np.ndarray) -> float:
-    span = float(np.linalg.norm(glove - backdrop))
-    if span < 1e-6:
-        return 0.0
-    return _clip01(1.0 - float(np.linalg.norm(patch - backdrop)) / span)
-
-def _opening_margin(area: float, cross_section: float) -> float:
-    if cross_section <= 1.0:
-        return 0.0
-    return _clip01(area / cross_section)
-
-def _position_margin(center: Tuple[int, int], tips: List[Tuple[int, int]], max_tip_distance: float) -> float:
-    if not tips or max_tip_distance <= 0:
-        return 0.0
-    return _clip01(1.0 - min(math.dist(center, tip) for tip in tips) / max_tip_distance)
-
-def _combine_margins(*margins: float) -> float:
-    values = [max(float(m), 1e-3) for m in margins]
-    return float(np.exp(sum(math.log(v) for v in values) / len(values)))
-
-def _mask_elongation(member: np.ndarray) -> float:
-    moments = cv2.moments(member.astype(np.uint8), binaryImage=True)
-    if moments["m00"] <= 0:
-        return 1.0
-    mu20 = moments["mu20"] / moments["m00"]
-    mu02 = moments["mu02"] / moments["m00"]
-    mu11 = moments["mu11"] / moments["m00"]
-    common = math.sqrt(max((mu20 - mu02) ** 2 + 4.0 * mu11 * mu11, 0.0))
-    major = math.sqrt(max(2.0 * (mu20 + mu02 + common), 0.0))
-    minor = math.sqrt(max(2.0 * (mu20 + mu02 - common), 0.0))
-    return float(major / max(minor, 1e-6))
-
-def bbox_around(point: Tuple[int, int], half: int, shape: Tuple[int, ...]) -> BBox:
-    height, width = shape[:2]
-    x = max(0, point[0] - half)
-    y = max(0, point[1] - half)
-    return (x, y, min(2 * half, width - x), min(2 * half, height - y))
-
-def convexity_defect_list(contour: np.ndarray) -> List[Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int], float]]:
-    if contour is None or len(contour) < 5:
-        return []
-    hull_idx = cv2.convexHull(contour, returnPoints=False)
-    if hull_idx is None or len(hull_idx) < 3:
-        return []
-    hull_idx = np.sort(hull_idx.flatten()).reshape(-1, 1)
-    try:
-        defects = cv2.convexityDefects(contour, hull_idx)
-    except cv2.error:
-        return []
-    if defects is None:
-        return []
-    result = []
-    for start_i, end_i, far_i, depth_fixed in defects.reshape(-1, 4):
-        start = tuple(int(v) for v in contour[start_i][0])
-        end = tuple(int(v) for v in contour[end_i][0])
-        far = tuple(int(v) for v in contour[far_i][0])
-        result.append((start, end, far, depth_fixed / 256.0))
-    return result
-
-def angle_at(far: Tuple[int, int], a: Tuple[int, int], b: Tuple[int, int]) -> float:
-    v1 = np.array(a, dtype=np.float64) - np.array(far, dtype=np.float64)
-    v2 = np.array(b, dtype=np.float64) - np.array(far, dtype=np.float64)
-    denominator = np.linalg.norm(v1) * np.linalg.norm(v2)
-    if denominator < 1e-9:
-        return 180.0
-    cosine = float(np.clip(np.dot(v1, v2) / denominator, -1.0, 1.0))
-    return math.degrees(math.acos(cosine))
-
-def hole_shape_metrics(contour: np.ndarray) -> Tuple[float, float]:
-    area = cv2.contourArea(contour)
-    x, y, width, height = cv2.boundingRect(contour)
-    extent = area / max(float(width * height), 1.0)
-    if len(contour) >= 5:
-        (_, _), (axis_a, axis_b), _ = cv2.fitEllipse(contour)
-        major, minor = max(axis_a, axis_b), max(min(axis_a, axis_b), 1e-6)
-        elongation = major / minor
-    else:
-        elongation = max(width, height) / max(min(width, height), 1)
-    return float(elongation), float(extent)
-
-
-def find_holes(seg: SegmentationResult, min_area: float, max_area: float, max_elongation: float = 4.5, min_extent: float = 0.35) -> List[Tuple[np.ndarray, BBox, float]]:
-    contours, _ = cv2.findContours(seg.holes_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    holes = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if not (min_area <= area <= max_area):
-            continue
-        elongation, extent = hole_shape_metrics(contour)
-        if elongation > max_elongation or extent < min_extent:
-            continue
-        holes.append((contour, cv2.boundingRect(contour), float(area)))
-    return holes
 
 def cut_by_frame(mask: np.ndarray, point: Tuple[int, int], palm_radius: float, reach_ratio: float) -> bool:
     if reach_ratio <= 0:
@@ -422,6 +309,54 @@ def locate_fingertips(seg: SegmentationResult, min_tip_distance_ratio: float, me
             merged.append(candidate)
     return merged[:max_tips]
 
+def components_as_boxes(mask: np.ndarray, min_area: float, min_extent: float = 0.0) -> List[Tuple[BBox, float, np.ndarray]]:
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    results: List[Tuple[BBox, float, np.ndarray]] = []
+    for i in range(1, count):
+        x, y, width, height, area = (int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP]), int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT]), float(stats[i, cv2.CC_STAT_AREA]))
+        if area < min_area:
+            continue
+        if min_extent > 0.0 and area / max(float(width * height), 1.0) < min_extent:
+            continue
+        results.append(((x, y, width, height), area, labels == i))
+    return results
+
+def _mask_elongation(member: np.ndarray) -> float:
+    moments = cv2.moments(member.astype(np.uint8), binaryImage=True)
+    if moments["m00"] <= 0:
+        return 1.0
+    mu20 = moments["mu20"] / moments["m00"]
+    mu02 = moments["mu02"] / moments["m00"]
+    mu11 = moments["mu11"] / moments["m00"]
+    common = math.sqrt(max((mu20 - mu02) ** 2 + 4.0 * mu11 * mu11, 0.0))
+    major = math.sqrt(max(2.0 * (mu20 + mu02 + common), 0.0))
+    minor = math.sqrt(max(2.0 * (mu20 + mu02 - common), 0.0))
+    return float(major / max(minor, 1e-6))
+
+def hole_shape_metrics(contour: np.ndarray) -> Tuple[float, float]:
+    area = cv2.contourArea(contour)
+    x, y, width, height = cv2.boundingRect(contour)
+    extent = area / max(float(width * height), 1.0)
+    if len(contour) >= 5:
+        (_, _), (axis_a, axis_b), _ = cv2.fitEllipse(contour)
+        major, minor = max(axis_a, axis_b), max(min(axis_a, axis_b), 1e-6)
+        elongation = major / minor
+    else:
+        elongation = max(width, height) / max(min(width, height), 1)
+    return float(elongation), float(extent)
+
+def find_holes(seg: SegmentationResult, min_area: float, max_area: float, max_elongation: float = 4.5, min_extent: float = 0.35) -> List[Tuple[np.ndarray, BBox, float]]:
+    contours, _ = cv2.findContours(seg.holes_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    holes = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if not (min_area <= area <= max_area):
+            continue
+        elongation, extent = hole_shape_metrics(contour)
+        if elongation > max_elongation or extent < min_extent:
+            continue
+        holes.append((contour, cv2.boundingRect(contour), float(area)))
+    return holes
 
 def fingertip_cross_section(mask: np.ndarray, tip: Tuple[int, int], center: Tuple[int, int], palm_radius: float, backoff_ratio: float = 0.30, distance: Optional[np.ndarray] = None) -> float:
     vector_x, vector_y = center[0] - tip[0], center[1] - tip[1]
@@ -436,29 +371,36 @@ def fingertip_cross_section(mask: np.ndarray, tip: Tuple[int, int], center: Tupl
     half_width = float(distance[sample_y, sample_x])
     return math.pi * half_width * half_width
 
-def is_finger_valley(start: Tuple[int, int], end: Tuple[int, int], tips: List[Tuple[int, int]], max_tip_distance: float) -> bool:
-    def nearest_tip(point: Tuple[int, int]) -> int:
-        best_index, best_distance = -1, float("inf")
-        for index, tip in enumerate(tips):
-            distance = math.dist(point, tip)
-            if distance < best_distance:
-                best_index, best_distance = index, distance
-        return best_index if best_distance <= max_tip_distance else -1
-    tip_a, tip_b = nearest_tip(start), nearest_tip(end)
-    return tip_a >= 0 and tip_b >= 0 and tip_a != tip_b
+def _clip01(value: float) -> float:
+    return float(min(1.0, max(0.0, value)))
 
+def _colour_margin(z_median: float, z_gate: float) -> float:
+    return _clip01(z_median / max(z_gate, 1e-6) - 1.0)
 
-def components_as_boxes(mask: np.ndarray, min_area: float, min_extent: float = 0.0) -> List[Tuple[BBox, float, np.ndarray]]:
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    results: List[Tuple[BBox, float, np.ndarray]] = []
-    for i in range(1, count):
-        x, y, width, height, area = (int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP]), int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT]), float(stats[i, cv2.CC_STAT_AREA]))
-        if area < min_area:
-            continue
-        if min_extent > 0.0 and area / max(float(width * height), 1.0) < min_extent:
-            continue
-        results.append(((x, y, width, height), area, labels == i))
-    return results
+def _opening_margin(area: float, cross_section: float) -> float:
+    if cross_section <= 1.0:
+        return 0.0
+    return _clip01(area / cross_section)
+
+def _position_margin(center: Tuple[int, int], tips: List[Tuple[int, int]], max_tip_distance: float) -> float:
+    if not tips or max_tip_distance <= 0:
+        return 0.0
+    return _clip01(1.0 - min(math.dist(center, tip) for tip in tips) / max_tip_distance)
+
+def _combine_margins(*margins: float) -> float:
+    values = [max(float(m), 1e-3) for m in margins]
+    return float(np.exp(sum(math.log(v) for v in values) / len(values)))
+
+def robust_stats(values: np.ndarray) -> Tuple[float, float]:
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return median, max(1.4826 * mad, 1e-6)
+
+def _backdrop_margin(patch: np.ndarray, backdrop: np.ndarray, glove: np.ndarray) -> float:
+    span = float(np.linalg.norm(glove - backdrop))
+    if span < 1e-6:
+        return 0.0
+    return _clip01(1.0 - float(np.linalg.norm(patch - backdrop)) / span)
 
 def find_showthrough_patches(image: np.ndarray, segmentation: SegmentationResult, config: Config, tips: List[Tuple[int, int]]) -> List[Tuple[BBox, float, str]]:
     cfg = config.tearing
@@ -497,12 +439,56 @@ def find_showthrough_patches(image: np.ndarray, segmentation: SegmentationResult
             cross_section = fingertip_cross_section(segmentation.mask, nearest, center, palm_radius, distance=distance)
             if cross_section > 1.0 and area / cross_section > cfg.max_showthrough_fingertip_fraction:
                 continue
-        confidence = _combine_margins(
-            _colour_margin(float(np.median(deviation[member])), cfg.showthrough_z_threshold),
-            _opening_margin(area, cross_section),
-            _position_margin(spot, tips, max_tip_distance))
+        confidence = _combine_margins(_colour_margin(float(np.median(deviation[member])), cfg.showthrough_z_threshold), _opening_margin(area, cross_section), _position_margin(spot, tips, max_tip_distance))
         patches.append(((x, y, w, h), confidence, "show-through {:.2%}".format(area / segmentation.area)))
     return patches
+
+def convexity_defect_list(contour: np.ndarray) -> List[Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int], float]]:
+    if contour is None or len(contour) < 5:
+        return []
+    hull_idx = cv2.convexHull(contour, returnPoints=False)
+    if hull_idx is None or len(hull_idx) < 3:
+        return []
+    hull_idx = np.sort(hull_idx.flatten()).reshape(-1, 1)
+    try:
+        defects = cv2.convexityDefects(contour, hull_idx)
+    except cv2.error:
+        return []
+    if defects is None:
+        return []
+    result = []
+    for start_i, end_i, far_i, depth_fixed in defects.reshape(-1, 4):
+        start = tuple(int(v) for v in contour[start_i][0])
+        end = tuple(int(v) for v in contour[end_i][0])
+        far = tuple(int(v) for v in contour[far_i][0])
+        result.append((start, end, far, depth_fixed / 256.0))
+    return result
+
+def is_finger_valley(start: Tuple[int, int], end: Tuple[int, int], tips: List[Tuple[int, int]], max_tip_distance: float) -> bool:
+    def nearest_tip(point: Tuple[int, int]) -> int:
+        best_index, best_distance = -1, float("inf")
+        for index, tip in enumerate(tips):
+            distance = math.dist(point, tip)
+            if distance < best_distance:
+                best_index, best_distance = index, distance
+        return best_index if best_distance <= max_tip_distance else -1
+    tip_a, tip_b = nearest_tip(start), nearest_tip(end)
+    return tip_a >= 0 and tip_b >= 0 and tip_a != tip_b
+
+def angle_at(far: Tuple[int, int], a: Tuple[int, int], b: Tuple[int, int]) -> float:
+    v1 = np.array(a, dtype=np.float64) - np.array(far, dtype=np.float64)
+    v2 = np.array(b, dtype=np.float64) - np.array(far, dtype=np.float64)
+    denominator = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if denominator < 1e-9:
+        return 180.0
+    cosine = float(np.clip(np.dot(v1, v2) / denominator, -1.0, 1.0))
+    return math.degrees(math.acos(cosine))
+
+def bbox_around(point: Tuple[int, int], half: int, shape: Tuple[int, ...]) -> BBox:
+    height, width = shape[:2]
+    x = max(0, point[0] - half)
+    y = max(0, point[1] - half)
+    return (x, y, min(2 * half, width - x), min(2 * half, height - y))
 
 def find_tear_evidence(image: np.ndarray, segmentation: SegmentationResult, config: Config) -> List[Tuple[BBox, float, str]]:
     cfg = config.tearing
@@ -529,10 +515,7 @@ def find_tear_evidence(image: np.ndarray, segmentation: SegmentationResult, conf
         cross_section = 0.0
         if nearest is not None and math.dist(spot, nearest) <= max_tip_distance:
             cross_section = fingertip_cross_section(segmentation.mask, nearest, center, palm_radius, distance=distance)
-        confidence = _combine_margins(
-            _backdrop_margin(hole_lab, backdrop, glove_lab),
-            _opening_margin(area, cross_section),
-            _position_margin(spot, tips, max_tip_distance))
+        confidence = _combine_margins(_backdrop_margin(hole_lab, backdrop, glove_lab), _opening_margin(area, cross_section), _position_margin(spot, tips, max_tip_distance))
         evidence.append((bbox, confidence, "hole {:.2%}".format(area / segmentation.area)))
     if palm_radius <= 1:
         return evidence
@@ -545,10 +528,7 @@ def find_tear_evidence(image: np.ndarray, segmentation: SegmentationResult, conf
         notch_angle = angle_at(far, start, end)
         if (depth_ratio >= cfg.min_defect_depth_ratio and notch_angle <= cfg.max_defect_angle_deg):
             half = max(8, int(0.15 * palm_radius))
-            confidence = _combine_margins(
-                _clip01(depth_ratio / max(cfg.min_defect_depth_ratio, 1e-6) - 1.0),
-                _clip01(1.0 - notch_angle / max(cfg.max_defect_angle_deg, 1e-6)),
-                _position_margin(far, tips, max_tip_distance))
+            confidence = _combine_margins(_clip01(depth_ratio / max(cfg.min_defect_depth_ratio, 1e-6) - 1.0), _clip01(1.0 - notch_angle / max(cfg.max_defect_angle_deg, 1e-6)), _position_margin(far, tips, max_tip_distance))
             evidence.append((bbox_around(far, half, segmentation.mask.shape), confidence, "notch depth={:.2f}R angle={:.0f}deg".format(depth_ratio, notch_angle)))
     return evidence
 
@@ -559,7 +539,6 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
     tips = locate_fingertips(segmentation, finger_cfg.min_tip_distance_ratio, finger_cfg.tip_merge_separation_ratio, finger_cfg.expected_fingers, finger_cfg.tip_frame_cut_reach_ratio)
     if not tips or palm_radius <= 1:
         return DefectResult(False, "tearing_at_finger", details="fingertips could not be localised")
-
     evidence = find_tear_evidence(image, segmentation, config)
     max_tip_distance = cfg.fingertip_radius_ratio * palm_radius
     locations: List[BBox] = []
@@ -574,9 +553,7 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
             notes.append("{} conf={:.2f}".format(note, confidence))
             score = max(score, confidence)
     joined = "; ".join(notes)
-    return DefectResult(defect_found=bool(locations), defect_type="tearing_at_finger", locations=locations,
-        score=score,
-        details=("{} of {} tear finding(s) at {} localised fingertip(s): {}".format(len(locations), len(evidence), len(tips), joined) if locations else "0 of {} tear finding(s) near {} localised fingertip(s)".format(len(evidence), len(tips))))
+    return DefectResult(defect_found=bool(locations), defect_type="tearing_at_finger", locations=locations, score=score, details=("{} of {} tear finding(s) at {} localised fingertip(s): {}".format(len(locations), len(evidence), len(tips), joined) if locations else "0 of {} tear finding(s) near {} localised fingertip(s)".format(len(evidence), len(tips))))
 
 def detect(image: np.ndarray, segmentation: Optional[SegmentationResult] = None, config: Optional[Config] = None) -> DefectResult:
     cfg = config or Config()
