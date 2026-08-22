@@ -20,7 +20,15 @@ C:\Tool\python\python.exe test_pipeline.py
 C:\Tool\python\python.exe evaluate.py
 ```
 
-`app.py` is the UI. `test_pipeline.py` runs a whole folder and writes
+`app.py` is the UI. It has two pages. The inspect page picks a defect on
+the left, the photos in the middle and lists a result per photo on the
+right. The compare page shows the original and the detected photo side by
+side at the same scale, with a filmstrip of the run underneath, and it can
+save the pair as one PNG for the report. Open it by double-clicking a
+result row or by clicking the small preview. Left and Right walk through
+the run and Esc goes back.
+
+`test_pipeline.py` runs a whole folder and writes
 report figures (original | mask | detection) to `output/`. `evaluate.py`
 prints precision and recall per detector, reading the ground truth from
 the filename (`kxi_latex_3.jpeg` → latex → should find `damage_by_fold`).
@@ -31,46 +39,51 @@ hits the Microsoft Store stub.
 ## Layout
 
 ```
-app.py          UI                  ui/     UI toolkit
-detectors/      one file per defect  gdd/   shared engine
-test_pipeline.py, evaluate.py        entry points
+app.py          UI, two pages        ui/     UI toolkit + compare page
+detectors/      one self-contained file per defect
+runner.py       local test host      test_pipeline.py, evaluate.py
 ```
 
-**`detectors/`** answers *does this glove have this defect*. **`gdd/`**
-answers *where is the glove, how big is it, how dark is this patch* — the
-measurements and the pipeline that every detector shares.
+**Each file in `detectors/` is standalone.** It carries its own
+preprocessing, segmentation, measurement helpers and thresholds, and
+imports nothing from this project — so it can be dropped into the group's
+shared UI, or any other host, on its own.
 
-| `gdd/` | |
-|---|---|
-| `config.py` | every tunable threshold |
-| `preprocessing.py` | resize, white balance, denoise |
-| `segmentation.py` | five-cue glove/background separation |
-| `features.py` | measurement helpers detectors build on |
-| `pipeline.py` | `GloveInspector`: runs the chain, draws results |
+That means the same front-end code appears in every detector file. This is
+deliberate. The group photographs gloves under different angles and
+lighting, so each defect needs to tune its own preprocessing and
+segmentation; one shared version would force a single compromise on all of
+them. The cost is that a fix to shared plumbing has to be applied per file.
+
+`runner.py` is NOT part of that contract. It is the local harness that
+`app.py`, `test_pipeline.py` and `evaluate.py` share, so the three behave
+identically: it drives detector modules, collects results, and draws the
+annotated photos and report figures.
 
 ## Adding a detector
 
-Write one file in `detectors/` with one function, then append a
-`DefectSpec` to `DEFECTS` in `detectors/__init__.py`. Nothing else changes.
+Write one self-contained file in `detectors/` exposing one function, then
+append a `DefectSpec` to `DEFECTS` in `detectors/__init__.py`. Nothing else
+in the project changes.
 
 ```python
-def detect(image, segmentation, config) -> DefectResult: ...
+def detect(image) -> DefectResult: ...
 ```
 
-`image` is the preprocessed BGR photo, `segmentation` carries the glove
-mask, contour and area, `config` is the shared `PipelineConfig`. Build on
-`gdd/features.py` instead of reimplementing geometry — it has the palm
-centre and radius, glove interior, fingertip locations, convexity defects,
-hole finding, robust statistics and local texture energy.
+`image` is a raw BGR photo straight from `cv2.imread`; the module does its
+own preprocessing and segmentation. Expose `Config`, `preprocess` and
+`segment_glove` as well and `runner.py` will drive that front end itself,
+which saves running it twice and lets a report figure show the mask your
+detector actually saw.
 
 Two conventions that matter, because the marker will use photos we have
 never seen:
 
 - Express thresholds as fractions of the palm radius or glove area, never
   in pixels, so they survive a change of camera or framing.
-- Take reference levels from the glove in the photo itself (see
-  `robust_stats`) rather than hard-coding them, so they adapt to colour,
-  material and lighting.
+- Take reference levels from the glove in the photo itself (robust median
+  and MAD) rather than hard-coding them, so they adapt to colour, material
+  and lighting.
 
 ## Current state
 

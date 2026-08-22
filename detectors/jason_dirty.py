@@ -37,6 +37,7 @@ class DirtConfig:
     texture_window: int = 9
     min_glove_chroma: float = 12.0
     min_off_hue_distance: float = 15.0
+    min_depth_ratio: float = 0.45
 
 @dataclass
 class Config:
@@ -259,6 +260,14 @@ def glove_interior(seg: SegmentationResult, margin_ratio: float) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))
     return cv2.erode(seg.mask, kernel)
 
+def interior_depth_map(seg: SegmentationResult) -> Tuple[np.ndarray, float]:
+    _, palm_radius = palm_center_and_radius(seg.mask)
+    depth = cv2.distanceTransform(seg.mask, cv2.DIST_L2, 5)
+    return depth, max(palm_radius, 1e-6)
+
+def region_depth_ratio(depth: np.ndarray, palm_radius: float, members: np.ndarray) -> float:
+    return float(np.median(depth[members])) / palm_radius
+
 def robust_stats(values: np.ndarray) -> Tuple[float, float]:
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
@@ -314,6 +323,7 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
     chroma = lab_chroma(image)
     glove_chroma = median_chroma(chroma, selection)
     hue_route_available = math.hypot(*glove_chroma) > cfg.min_glove_chroma
+    depth, palm_radius = interior_depth_map(segmentation)
     candidate = ((z_score > cfg.z_threshold) & selection).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel)
@@ -321,7 +331,12 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
     locations: List[BBox] = []
     stained_area = 0.0
     evidence: List[str] = []
+    shallow = 0
     for bbox, area, members in components_as_boxes(candidate, min_area=cfg.min_area_fraction * segmentation.area, min_extent=cfg.min_extent):
+        depth_ratio = region_depth_ratio(depth, palm_radius, members)
+        if depth_ratio < cfg.min_depth_ratio:
+            shallow += 1
+            continue
         texture_ratio = float(np.median(texture[members])) / glove_texture
         off_hue = off_hue_distance(median_chroma(chroma, members), glove_chroma)
         covered = texture_ratio <= cfg.max_texture_ratio
@@ -337,7 +352,7 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
         defect_type="dirty",
         locations=locations,
         score=min(1.0, stained_fraction / 0.05) if locations else 0.0,
-        details=(f"{len(locations)} dirty region(s), {stained_fraction:.2%} of the glove ({'; '.join(evidence)})" if locations else f"no region that is off-colour (z>{cfg.z_threshold:g}) and either texture-free (<{cfg.max_texture_ratio:g}x) or off-hue" + ("" if hue_route_available else "; glove too neutral for the hue test")))
+        details=(f"{len(locations)} dirty region(s), {stained_fraction:.2%} of the glove ({'; '.join(evidence)})" if locations else f"no region that is off-colour (z>{cfg.z_threshold:g}) and either texture-free (<{cfg.max_texture_ratio:g}x) or off-hue" + (f"; {shallow} candidate(s) sat too close to the glove edge to be surface dirt" if shallow else "") + ("" if hue_route_available else "; glove too neutral for the hue test")))
 
 def detect(image: np.ndarray, segmentation: Optional[SegmentationResult] = None, config: Optional[Config] = None) -> DefectResult:
     cfg = config or Config()

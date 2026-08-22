@@ -49,6 +49,9 @@ class FoldConfig:
     stripe_tensor_sigma_ratio: float = 0.035
     stripe_deviation_degrees: float = 25.0
     use_chroma_residual: bool = True
+    material_edge_z: float = 8.0
+    material_edge_sigma_ratio: float = 0.02
+    material_edge_dilate_ratio: float = 0.03
 
 @dataclass
 class Config:
@@ -450,6 +453,24 @@ def _is_shadow(contour: np.ndarray, lightness: np.ndarray, glove_median: float, 
     delta = float(np.median(lightness[inside])) - glove_median
     return delta <= cfg.max_lightness_delta, delta
 
+def material_boundary(image: np.ndarray, interior: np.ndarray, palm_radius: float, cfg: FoldConfig) -> np.ndarray:
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    sigma = max(1.0, cfg.material_edge_sigma_ratio * palm_radius)
+    edge = np.zeros(image.shape[:2], np.float32)
+    for channel in (1, 2):
+        blurred = cv2.GaussianBlur(lab[:, :, channel], (0, 0), sigma)
+        gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+        edge += np.hypot(gx, gy)
+    inside = interior > 0
+    if not inside.any():
+        return np.zeros(image.shape[:2], np.uint8)
+    median, spread = robust_stats(edge[inside])
+    band = ((edge > median + cfg.material_edge_z * spread) & inside).astype(np.uint8) * 255
+    size = max(3, int(cfg.material_edge_dilate_ratio * palm_radius)) | 1
+    return cv2.dilate(band, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)))
+
+
 def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config) -> DefectResult:
     cfg = config.fold
     interior = glove_interior(segmentation, cfg.interior_margin_ratio)
@@ -469,6 +490,8 @@ def _analyse(image: np.ndarray, segmentation: SegmentationResult, config: Config
     response = fold_ridge_response(image, interior, palm_radius, cfg)
     _, spread = robust_stats(response[interior > 0])
     ridge = ((np.abs(response) > cfg.z_threshold * spread) & (palm_region > 0)).astype(np.uint8) * 255
+    ridge = cv2.bitwise_and(ridge, cv2.bitwise_not(
+        material_boundary(image, interior, palm_radius, cfg)))
     pools["shading"] = _fragment_pool(ridge, cfg)
     for contour, major in _shaped_creases(ridge, palm_region, palm_radius, cfg, bridge=True):
         candidates.append((contour, major, "shading"))
