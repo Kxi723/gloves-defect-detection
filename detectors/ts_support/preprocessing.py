@@ -9,7 +9,7 @@ from .config import PreprocessConfig
 
 
 def resize_to_limit(image: np.ndarray, max_dimension: int) -> np.ndarray:
-
+    
     height, width = image.shape[:2]
     longest = max(height, width)
     if longest <= max_dimension:
@@ -22,7 +22,7 @@ def resize_to_limit(image: np.ndarray, max_dimension: int) -> np.ndarray:
 def preprocess(
     image: np.ndarray, config: Optional[PreprocessConfig] = None
 ) -> np.ndarray:
-
+    
     cfg = config or PreprocessConfig()
     if image is None or image.size == 0:
         raise ValueError("preprocess() received an empty image")

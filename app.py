@@ -450,8 +450,17 @@ class DefectApp:
                 status = "MATCH" if result.defect_found else "NO MATCH"
                 row = Row(name=path.name, status=status, score=result.score, evidence=result.details, annotated=annotated, warnings=report.warnings, path=path)
             if result is not None:
+                # Prefer detector-owned stage masks. If a detector uses the
+                # runner-driven front end, its segmentation is the glove mask.
                 row.glove_mask = getattr(result, "analysis_mask", None)
+                if row.glove_mask is None and report.segmentation is not None:
+                    row.glove_mask = getattr(report.segmentation, "mask_raw", None)
+                    if row.glove_mask is None:
+                        row.glove_mask = getattr(report.segmentation, "mask", None)
+
                 row.defect_mask = getattr(result, "debug_mask", None)
+                if row.defect_mask is None:
+                    row.defect_mask = getattr(result, "mask", None)
             self._queue.put(("row", token, row))
         self._queue.put(("done", token, spec))
 
@@ -510,7 +519,7 @@ class DefectApp:
             self.summary_detail.configure(text=detail)
         self.save_button.set_enabled(any(r.annotated is not None for r in self.rows))
         self.compare_button.set_enabled(bool(self.rows))
-        self._set_status(f"Done. {total} photo(s) inspected.  Double-click a row to compare it with the original.")
+        self._set_status(f"Done. {total} photo(s) inspected.  Compare any result row.")
 
     def _clear_results(self) -> None:
         self.result_list.clear("Inspecting…")

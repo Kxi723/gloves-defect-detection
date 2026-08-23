@@ -6,20 +6,15 @@ import numpy as np
 from .TanYikTing_support.config import PipelineConfig
 from .TanYikTing_support.preprocessing import preprocess
 from .TanYikTing_support.features import BBox, DefectResult, palm_center_and_radius, robust_stats
-from .TanYikTing_support.segmentation import SegmentationResult, segment_glove
+from .TanYikTing_support.segmentation import SegmentationResult, segment_glove, find_forearm_component
 from .TanYikTing_support.tearing_helpers import find_showthrough_patches
 
 
 # runner setup
 Config = PipelineConfig
-def _contact_side(mask: np.ndarray) -> str:
-    counts: Dict[str, int] = {
-        "top": int(np.count_nonzero(mask[0, :])),
-        "bottom": int(np.count_nonzero(mask[-1, :])),
-        "left": int(np.count_nonzero(mask[:, 0])),
-        "right": int(np.count_nonzero(mask[:, -1])),
-    }
-    return max(counts, key=counts.get)
+def _cuff_side(image: np.ndarray, mask: np.ndarray) -> str:
+    side, _, _, _ = find_forearm_component(image, mask)
+    return side
 
 
 def _inside_cuff_exclusion(x: int, y: int, w: int, h: int,
@@ -64,7 +59,7 @@ def _light_glove_tears(image: np.ndarray, segmentation: SegmentationResult,
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         (candidate > 0).astype(np.uint8), connectivity=8)
     image_h, image_w = candidate.shape
-    cuff_side = _contact_side(segmentation.mask)
+    cuff_side = _cuff_side(image, segmentation.mask)
 
     locations: List[BBox] = []
     accepted_mask = np.zeros_like(candidate)

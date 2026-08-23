@@ -9,20 +9,22 @@ from .ts_support.preprocessing import preprocess, resize_to_limit
 from .ts_support.segmentation import (
     SegmentationResult,
     basic_global_threshold,
+    hsi_saturation_and_intensity,
     segment_glove,
 )
 
 def _odd_kernel_size(value: float, minimum: int = 3) -> int:
-
+    
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
+
 
 def _median_local_texture(
     image_bgr: np.ndarray,
     glove_selection: np.ndarray,
     window_size: int,
 ) -> float:
-
+    
     grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     local_mean = cv2.blur(grey, (window_size, window_size))
     local_square_mean = cv2.blur(grey * grey, (window_size, window_size))
@@ -31,11 +33,12 @@ def _median_local_texture(
     )
     return float(np.median(local_texture[glove_selection]))
 
+
 def _skin_pixels_rgb(
     image_bgr: np.ndarray,
     cfg: SkinColourConfig,
 ) -> np.ndarray:
-
+    
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
     red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
     channel_range = (
@@ -56,11 +59,12 @@ def _skin_pixels_rgb(
     )
     return np.where(skin_pixels, 255, 0).astype(np.uint8)
 
+
 def _largest_component(
     mask: np.ndarray,
     minimum_area: int,
 ) -> tuple[np.ndarray, BBox | None, int]:
-
+    
     count, labels, statistics, _ = cv2.connectedComponentsWithStats(mask, 8)
     best_label = 0
     best_area = 0
@@ -82,12 +86,13 @@ def _largest_component(
     )
     return component, box, best_area
 
+
 def _refine_cotton_segmentation(
     segmentation: SegmentationResult,
     image_bgr: np.ndarray,
     config: PipelineConfig,
 ) -> SegmentationResult:
-
+    
     cfg = config.improper_roll
     shortest_side = min(segmentation.mask.shape)
     vertical_size = _odd_kernel_size(
@@ -103,6 +108,9 @@ def _refine_cotton_segmentation(
         minimum=3,
     )
 
+    
+    
+    
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     image_height, image_width = rgb.shape[:2]
     border_width = max(
@@ -153,7 +161,9 @@ def _refine_cotton_segmentation(
     else:
         colour_solid = np.zeros_like(colour_mask)
 
-
+    
+    
+    
     support_size = _odd_kernel_size(
         shortest_side * cfg.cotton_mask_support_dilate_fraction,
         minimum=5,
@@ -197,13 +207,14 @@ def _refine_cotton_segmentation(
         source_image=segmentation.source_image,
     )
 
+
 def _cuff_box(
     glove_box: BBox,
     start_fraction: float,
     height_fraction: float,
     image_shape: tuple[int, ...],
 ) -> BBox:
-
+    
     glove_x, glove_y, glove_width, glove_height = glove_box
     image_height, image_width = image_shape[:2]
     x = max(0, glove_x)
@@ -214,12 +225,13 @@ def _cuff_box(
     )
     return x, y, width, height
 
+
 def _cotton_measurements(
     source_image: np.ndarray,
     segmentation: SegmentationResult,
     config: PipelineConfig,
 ) -> tuple[bool, float, float, float, np.ndarray]:
-
+    
     cfg = config.improper_roll
     glove_x, glove_y, glove_width, glove_height = segmentation.bbox
     rgb = cv2.cvtColor(source_image, cv2.COLOR_BGR2RGB).astype(np.int16)
@@ -258,7 +270,9 @@ def _cotton_measurements(
     band_y_fraction = (band_centre_y - glove_y) / max(glove_height, 1)
     band_bottom = band_y + band_height - 1
 
-
+    
+    
+    
     fold_material_mask = np.zeros_like(segmentation.mask)
     fold_material_mask[band_bottom + 1 :, :] = segmentation.mask[
         band_bottom + 1 :, :
@@ -289,12 +303,13 @@ def _cotton_measurements(
         debug_mask,
     )
 
+
 def _horizontal_fold_edge(
     source_image: np.ndarray,
     segmentation: SegmentationResult,
     config: PipelineConfig,
 ) -> tuple[float, float, float, np.ndarray]:
-
+    
     cfg = config.improper_roll
     glove_x, glove_y, glove_width, glove_height = segmentation.bbox
     grey = cv2.cvtColor(source_image, cv2.COLOR_BGR2GRAY)
@@ -351,12 +366,13 @@ def _horizontal_fold_edge(
     ).astype(np.uint8)
     return best_score, best_continuity, float(edge_y_fraction), edge_mask
 
+
 def _nitrile_measurements(
     source_image: np.ndarray,
     segmentation: SegmentationResult,
     config: PipelineConfig,
 ) -> tuple[bool, float, float, float, float, float, np.ndarray]:
-
+    
     cfg = config.improper_roll
     glove_x, glove_y, glove_width, glove_height = segmentation.bbox
 
@@ -423,12 +439,15 @@ def _nitrile_measurements(
     minimum_edge_score = (
         cfg.nitrile_normal_edge_score + cfg.nitrile_min_edge_increase
     )
-
-
+    
+    
+    
+    
     shortened_cuff = glove_aspect < cfg.nitrile_max_aspect
     fold_edge_present = (
         edge_score >= minimum_edge_score
         and edge_continuity >= cfg.nitrile_min_edge_continuity
+        and edge_y_fraction >= cfg.nitrile_min_edge_y_fraction
     )
     found = shortened_cuff and fold_edge_present
     debug_mask = cv2.bitwise_or(kept_skin_mask, edge_mask)
@@ -442,11 +461,12 @@ def _nitrile_measurements(
         debug_mask,
     )
 
+
 def detect(
     image: np.ndarray,
     config: PipelineConfig | None = None,
 ) -> DefectResult:
-
+    
     config = config or get_config()
     source_image = resize_to_limit(image, config.preprocess.max_dimension)
     image = preprocess(image, config.preprocess)
@@ -500,6 +520,26 @@ def detect(
         segmentation = _refine_cotton_segmentation(
             segmentation, image, config
         )
+    else:
+        
+        
+        saturation, intensity = hsi_saturation_and_intensity(source_image)
+        median_glove_intensity = float(np.median(intensity[glove_selection]))
+        median_glove_saturation = float(np.median(saturation[glove_selection]))
+        if (
+            median_glove_intensity > cfg.nitrile_max_glove_intensity
+            or median_glove_saturation > cfg.nitrile_max_glove_saturation
+        ):
+            return DefectResult(
+                False,
+                "improper_roll",
+                details=(
+                    "smooth non-blue glove is outside the calibrated black "
+                    "Nitrile intensity/saturation range"
+                ),
+                debug_mask=np.zeros_like(segmentation.mask),
+                analysis_mask=segmentation.mask,
+            )
 
     if is_cotton:
         (

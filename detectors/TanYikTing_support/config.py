@@ -136,7 +136,7 @@ class GeneralTearingConfig:
     light_skin_saturation_min: float = 30.0
     light_skin_value_min: float = 120.0
     light_saturation_residual_min: float = 20.0
-    light_min_component_area_fraction: float = 0.0012
+    light_min_component_area_fraction: float = 0.0008
     light_max_component_area_fraction: float = 0.02
     light_min_short_side_pixels: int = 10
     light_cuff_exclusion_fraction: float = 0.30
@@ -170,7 +170,7 @@ class SpottingConfig:
 
     min_spot_count: int = 3
     min_spread_ratio: float = 2.0
-    min_total_area_fraction: float = 0.0023
+    min_total_area_fraction: float = 0.0008
     full_confidence_count: int = 8
     full_confidence_spread_ratio: float = 5.0
 

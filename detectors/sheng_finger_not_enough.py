@@ -14,68 +14,12 @@ def _odd_kernel_size(value: float, minimum: int = 3) -> int:
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
 
-def _morphological_skeleton(mask: np.ndarray) -> np.ndarray:
-
-    work = np.where(mask > 0, 255, 0).astype(np.uint8)
-    skeleton = np.zeros_like(work)
-    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    while cv2.countNonZero(work):
-        opened = cv2.morphologyEx(work, cv2.MORPH_OPEN, element)
-        skeleton = cv2.bitwise_or(
-            skeleton, cv2.subtract(work, opened)
-        )
-        work = cv2.erode(work, element)
-    return skeleton
-
-def _skin_branch_fraction(
-    glove_mask: np.ndarray,
-    skin_mask: np.ndarray,
-    glove_box: BBox,
-) -> float:
-
-    glove_x, glove_y, glove_width, glove_height = glove_box
-    hand_mask = cv2.bitwise_or(glove_mask, skin_mask)
-    hand_crop = hand_mask[
-        glove_y:glove_y + glove_height,
-        glove_x:glove_x + glove_width,
-    ]
-    skin_crop = skin_mask[
-        glove_y:glove_y + glove_height,
-        glove_x:glove_x + glove_width,
-    ]
-    if hand_crop.size == 0 or cv2.countNonZero(skin_crop) == 0:
-        return 0.0
-
-    maximum_side = 256
-    scale = min(
-        1.0,
-        maximum_side / max(glove_width, glove_height, 1),
-    )
-    small_size = (
-        max(1, round(glove_width * scale)),
-        max(1, round(glove_height * scale)),
-    )
-    hand_small = cv2.resize(
-        hand_crop, small_size, interpolation=cv2.INTER_NEAREST
-    )
-    skin_small = cv2.resize(
-        skin_crop, small_size, interpolation=cv2.INTER_NEAREST
-    )
-    skeleton = _morphological_skeleton(hand_small)
-    skin_neighbourhood = cv2.dilate(
-        skin_small,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-    )
-    branch_pixels = cv2.countNonZero(
-        cv2.bitwise_and(skeleton, skin_neighbourhood)
-    )
-    return branch_pixels / max(small_size[1], 1)
 
 def detect(
     image: np.ndarray,
     config: PipelineConfig | None = None,
 ) -> DefectResult:
-
+    
     config = config or get_config()
     source_image = resize_to_limit(image, config.preprocess.max_dimension)
     image = preprocess(image, config.preprocess)
@@ -149,53 +93,58 @@ def detect(
         area = int(statistics[label, cv2.CC_STAT_AREA])
         if area < minimum_component_area:
             continue
+        component_x = int(statistics[label, cv2.CC_STAT_LEFT])
+        component_y = int(statistics[label, cv2.CC_STAT_TOP])
+        component_width = int(statistics[label, cv2.CC_STAT_WIDTH])
+        component_height = int(statistics[label, cv2.CC_STAT_HEIGHT])
+        component_fraction = area / max(segmentation.area, 1.0)
+        relative_x = (component_x - glove_x) / max(glove_width, 1)
+        relative_y = (component_y - glove_y) / max(glove_height, 1)
+        relative_width = component_width / max(glove_width, 1)
+        relative_height = component_height / max(glove_height, 1)
+        component_aspect = component_width / max(component_height, 1)
+        at_fingertip = (
+            relative_y <= cfg.fingertip_top_fraction
+            or relative_x <= cfg.fingertip_side_fraction
+            or relative_x + relative_width
+            >= 1.0 - cfg.fingertip_side_fraction
+        )
+        plausible_shape = (
+            component_fraction <= cfg.max_component_fraction
+            and cfg.min_component_width_fraction
+            <= relative_width
+            <= cfg.max_component_width_fraction
+            and relative_height <= cfg.max_component_height_fraction
+            and cfg.min_component_aspect
+            <= component_aspect
+            <= cfg.max_component_aspect
+        )
+        if not (at_fingertip and plausible_shape):
+            continue
         kept_mask[labels == label] = 255
         locations.append((
-            int(statistics[label, cv2.CC_STAT_LEFT]),
-            int(statistics[label, cv2.CC_STAT_TOP]),
-            int(statistics[label, cv2.CC_STAT_WIDTH]),
-            int(statistics[label, cv2.CC_STAT_HEIGHT]),
+            component_x,
+            component_y,
+            component_width,
+            component_height,
         ))
         exposed_area += area
 
     exposed_fraction = exposed_area / max(segmentation.area, 1.0)
 
-
-    skeleton_branch_fraction = 0.0
-    primary_area_pass = (
-        exposed_fraction >= cfg.min_exposed_area_fraction
-    )
-    marginal_area_threshold = (
-        cfg.marginal_area_ratio * cfg.min_exposed_area_fraction
-    )
-    if not primary_area_pass and exposed_fraction >= marginal_area_threshold:
-        skeleton_branch_fraction = _skin_branch_fraction(
-            segmentation.mask, kept_mask, segmentation.bbox
-        )
-    skeleton_pass = (
-        exposed_fraction >= marginal_area_threshold
-        and skeleton_branch_fraction >= cfg.min_skeleton_branch_fraction
-    )
-    found = primary_area_pass or skeleton_pass
+    found = exposed_fraction >= cfg.min_exposed_area_fraction
     if not found:
         locations = []
     return DefectResult(
         defect_found=found,
         defect_type="finger_not_enough",
         locations=locations,
-        score=min(
-            1.0,
-            max(
-                exposed_fraction / cfg.area_score_scale,
-                skeleton_branch_fraction / cfg.skeleton_score_scale,
-            ),
-        ) if found else 0.0,
+        score=min(1.0, exposed_fraction / cfg.area_score_scale)
+        if found else 0.0,
         details=(
             f"connected exposed-skin area {exposed_fraction:.2%} of glove "
             f"(threshold {cfg.min_exposed_area_fraction:.2%}); "
-            f"skin-linked skeleton branch {skeleton_branch_fraction:.2%} "
-            f"of glove height (marginal-area support threshold "
-            f"{cfg.min_skeleton_branch_fraction:.2%})"
+            f"{len(locations)} fingertip-shaped component(s)"
         ),
         debug_mask=kept_mask,
         analysis_mask=segmentation.mask,

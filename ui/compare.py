@@ -55,7 +55,7 @@ class ComparePage(tk.Frame):
         wrap.columnconfigure(0, weight=1, uniform="stage")
         wrap.columnconfigure(1, weight=1, uniform="stage")
         self._left_stage, self._left_image = self._make_stage(wrap, 0, "ORIGINAL", "as photographed")
-        self._right_stage, self._right_image = self._make_stage(wrap, 1, "DETECTED", "outline in green, findings boxed")
+        self._right_stage, self._right_image = self._make_stage(wrap, 1, "DETECTED", "detector findings highlighted / boxed")
         self._caption = ClipLabel(self, "", font=theme.font(9), fg=theme.INK_SOFT, bg=theme.APP_BG)
         self._caption.pack(fill="x", padx=px(20), pady=(0, px(8)))
         self._left_stage.bind("<Configure>", self._on_resize)
