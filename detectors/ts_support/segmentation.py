@@ -8,19 +8,23 @@ import numpy as np
 
 from .config import SegmentationConfig
 
+
 @dataclass
 class SegmentationResult:
-    mask: np.ndarray
-    contour: np.ndarray
-    bbox: Tuple[int, int, int, int]
-    area: float
-    cue: str = "unknown"
-    source_image: Optional[np.ndarray] = None
+    
+
+    mask: np.ndarray          
+    contour: np.ndarray       
+    bbox: Tuple[int, int, int, int]  
+    area: float               
+    cue: str = "unknown"      
+    source_image: Optional[np.ndarray] = None  
+
 
 def hsi_saturation_and_intensity(
     image_bgr: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-
+    
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     channel_sum = rgb.sum(axis=2)
     safe_sum = np.maximum(channel_sum, 1.0)
@@ -29,6 +33,7 @@ def hsi_saturation_and_intensity(
     saturation[channel_sum <= 0.0] = 0.0
     return np.clip(saturation, 0.0, 1.0), intensity
 
+
 def basic_global_threshold(
     channel: np.ndarray,
     *,
@@ -36,7 +41,7 @@ def basic_global_threshold(
     tolerance: float = 1.0,
     maximum_iterations: int = 30,
 ) -> np.ndarray:
-
+    
     values = channel.astype(np.float32)
     finite_values = values[np.isfinite(values)]
     if finite_values.size == 0:
@@ -64,26 +69,30 @@ def basic_global_threshold(
     selected = values <= threshold if invert else values > threshold
     return np.where(selected, 255, 0).astype(np.uint8)
 
+
 def _hsi_channel_masks(
     saturation: np.ndarray,
     intensity: np.ndarray,
 ) -> List[np.ndarray]:
-
+    
     return [
         basic_global_threshold(saturation, tolerance=1.0 / 255.0),
         basic_global_threshold(intensity),
         basic_global_threshold(intensity, invert=True),
     ]
 
+
 def _texture_energy_mask(intensity: np.ndarray, window: int) -> np.ndarray:
+    
     mean = cv2.blur(intensity, (window, window))
     mean_of_squares = cv2.blur(intensity * intensity, (window, window))
-
+    
     std = np.sqrt(np.maximum(mean_of_squares - mean * mean, 0.0))
     std = cv2.GaussianBlur(std, (0, 0), window / 2.0)
     return basic_global_threshold(std)
 
 def _score_candidate(mask: np.ndarray, cfg: SegmentationConfig) -> float:
+    
     image_area = float(mask.shape[0] * mask.shape[1])
     cleaned = _morphological_cleanup(mask, cfg)
     count, labels = cv2.connectedComponents(cleaned)
@@ -104,7 +113,8 @@ def _score_candidate(mask: np.ndarray, cfg: SegmentationConfig) -> float:
 
     border = np.concatenate([solid[0, :], solid[-1, :], solid[:, 0], solid[:, -1]])
     border_occupancy = float(np.count_nonzero(border)) / float(border.size)
-
+    
+    
     shred = np.count_nonzero(cv2.subtract(solid, component)) / max(solid_area, 1.0)
     hull_perimeter = max(cv2.arcLength(cv2.convexHull(contour), True), 1.0)
     raggedness = cv2.arcLength(contour, True) / hull_perimeter
@@ -114,8 +124,9 @@ def _score_candidate(mask: np.ndarray, cfg: SegmentationConfig) -> float:
             - 4.0 * min(shred, 0.5)
             - 0.5 * max(0.0, raggedness - 1.6))
 
-def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
 
+def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
+    
     open_k = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel)
     )
@@ -127,8 +138,7 @@ def _morphological_cleanup(mask: np.ndarray, cfg: SegmentationConfig) -> np.ndar
     return cleaned
 
 def _keep_largest_component(mask: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-
-
+    
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return np.zeros_like(mask), None
@@ -137,15 +147,14 @@ def _keep_largest_component(mask: np.ndarray) -> Tuple[np.ndarray, Optional[np.n
     cv2.drawContours(solid, [largest], -1, 255, thickness=cv2.FILLED)
     return solid, largest
 
+
 def segment_glove(
     image: np.ndarray, config: Optional[SegmentationConfig] = None
 ) -> Optional[SegmentationResult]:
-
-
+    
     cfg = config or SegmentationConfig()
     saturation, intensity = hsi_saturation_and_intensity(image)
-
-
+    
     hsi_masks = _hsi_channel_masks(saturation, intensity)
     candidates: List[Tuple[str, np.ndarray]] = []
     candidates.append(("hsi_saturation", hsi_masks[0]))
@@ -159,11 +168,11 @@ def segment_glove(
               for name, mask in candidates]
     best_score, best_cue, best_mask = max(scored, key=lambda triple: triple[0])
     if best_score < 0:
-        return None
+        return None  
 
     cleaned = _morphological_cleanup(best_mask, cfg)
-
-
+    
+    
     num, labels = cv2.connectedComponents(cleaned)
     if num <= 1:
         return None
@@ -172,7 +181,7 @@ def segment_glove(
     )
     component = np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
-
+    
     solid, contour = _keep_largest_component(component)
     if contour is None:
         return None

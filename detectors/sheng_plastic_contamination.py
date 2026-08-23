@@ -14,9 +14,8 @@ from .ts_support.segmentation import (
     segment_glove,
 )
 
-
 def _odd_kernel_size(value: float, minimum: int = 3) -> int:
-
+    
     size = max(minimum, int(round(value)))
     return size if size % 2 == 1 else size + 1
 
@@ -25,7 +24,7 @@ def _local_texture_ratio(
     selection: np.ndarray,
     window_size: int,
 ) -> tuple[np.ndarray, float]:
-
+    
     _, intensity = hsi_saturation_and_intensity(image_bgr)
     local_mean = cv2.blur(intensity, (window_size, window_size))
     local_square_mean = cv2.blur(
@@ -47,7 +46,7 @@ def _keep_regions(
     quality_image: np.ndarray | None = None,
     minimum_quality: float | None = None,
 ) -> tuple[np.ndarray, List[BBox], float]:
-
+    
     count, labels, statistics, _ = cv2.connectedComponentsWithStats(mask, 8)
     kept = np.zeros_like(mask)
     plausible_components: list[tuple[np.ndarray, BBox, int]] = []
@@ -67,7 +66,9 @@ def _keep_regions(
             if component_quality < minimum_quality:
                 continue
 
-
+        
+        
+        
         component = np.where(labels == label, 255, 0).astype(np.uint8)
         contours, _ = cv2.findContours(
             component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -82,7 +83,9 @@ def _keep_regions(
             continue
         plausible_components.append((filled, (x, y, width, height), filled_area))
 
-
+    
+    
+    
     groups: list[tuple[np.ndarray, BBox, int]] = []
     for component, box, area in plausible_components:
         x, y, width, height = box
@@ -130,13 +133,98 @@ def _keep_regions(
 
     return kept, locations, total_area
 
+
+def _filter_interior_regions(
+    mask: np.ndarray,
+    saturation: np.ndarray,
+    intensity: np.ndarray,
+    glove_box: BBox,
+    glove_area: float,
+    *,
+    is_blue_latex: bool,
+    config: PipelineConfig,
+) -> tuple[np.ndarray, List[BBox], float]:
+    
+    cfg = config.plastic_contamination
+    glove_x, glove_y, glove_width, glove_height = glove_box
+    count, labels, statistics, _ = cv2.connectedComponentsWithStats(mask, 8)
+    filtered = np.zeros_like(mask)
+    locations: List[BBox] = []
+    total_area = 0.0
+
+    for label in range(1, count):
+        x = int(statistics[label, cv2.CC_STAT_LEFT])
+        y = int(statistics[label, cv2.CC_STAT_TOP])
+        width = int(statistics[label, cv2.CC_STAT_WIDTH])
+        height = int(statistics[label, cv2.CC_STAT_HEIGHT])
+        area = int(statistics[label, cv2.CC_STAT_AREA])
+        width_fraction = width / max(glove_width, 1)
+        height_fraction = height / max(glove_height, 1)
+        centre_x_fraction = (
+            x + width / 2.0 - glove_x
+        ) / max(glove_width, 1)
+        centre_y_fraction = (
+            y + height / 2.0 - glove_y
+        ) / max(glove_height, 1)
+        area_fraction = area / max(glove_area, 1.0)
+        component = labels == label
+        median_saturation = float(np.median(saturation[component]))
+        median_intensity = float(np.median(intensity[component]))
+
+        if width_fraction < cfg.region_min_width_fraction:
+            continue
+        if height_fraction < cfg.region_min_height_fraction:
+            continue
+        if not (
+            cfg.region_centre_x_min_fraction
+            <= centre_x_fraction
+            <= cfg.region_centre_x_max_fraction
+        ):
+            continue
+        centre_y_minimum = (
+            cfg.region_centre_y_min_fraction
+            if is_blue_latex
+            else cfg.nitrile_region_centre_y_min_fraction
+        )
+        if not (
+            centre_y_minimum
+            <= centre_y_fraction
+            <= cfg.region_centre_y_max_fraction
+        ):
+            continue
+        if area_fraction > cfg.region_max_area_fraction:
+            continue
+        if is_blue_latex:
+            if median_saturation < cfg.latex_min_region_median_saturation:
+                continue
+        else:
+            if not (
+                cfg.nitrile_min_region_median_saturation
+                <= median_saturation
+                <= cfg.nitrile_max_region_median_saturation
+            ):
+                continue
+            if not (
+                cfg.nitrile_min_region_median_intensity
+                <= median_intensity
+                <= cfg.nitrile_max_region_median_intensity
+            ):
+                continue
+
+        filtered[component] = 255
+        locations.append((x, y, width, height))
+        total_area += area
+
+    return filtered, locations, total_area
+
+
 def _blue_latex_glove_mask(
     source_image: np.ndarray,
     segmentation: SegmentationResult,
     glove_interior: np.ndarray,
     config: PipelineConfig,
 ) -> np.ndarray:
-
+    
     cfg = config.plastic_contamination
     rgb = cv2.cvtColor(source_image, cv2.COLOR_BGR2RGB).astype(np.float32)
     red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
@@ -170,6 +258,8 @@ def _blue_latex_glove_mask(
         blue_mask, cv2.MORPH_CLOSE, close_element, iterations=2
     )
 
+    
+    
     count, labels, _, _ = cv2.connectedComponentsWithStats(blue_mask, 8)
     support = np.zeros_like(blue_mask)
     interior_selection = glove_interior > 0
@@ -191,6 +281,7 @@ def _blue_latex_glove_mask(
     cv2.drawContours(detector_mask, [largest], -1, 255, cv2.FILLED)
     return detector_mask
 
+
 def _zone_masks(
     support: np.ndarray,
     bbox: BBox,
@@ -198,7 +289,7 @@ def _zone_masks(
     *,
     palm_end_fraction: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-
+    
     cfg = config.plastic_contamination
     _, glove_y, _, glove_height = bbox
     finger_end = glove_y + round(glove_height * cfg.finger_end_fraction)
@@ -218,6 +309,7 @@ def _zone_masks(
     cuff[:palm_end, :] = False
     return finger, palm, cuff
 
+
 def _zone_reference_candidate(
     zone: np.ndarray,
     saturation: np.ndarray,
@@ -231,7 +323,7 @@ def _zone_reference_candidate(
     smooth_intensity_gain: float | None = None,
     smooth_max_saturation: float | None = None,
 ) -> np.ndarray:
-
+    
     if np.count_nonzero(zone) < minimum_pixels:
         return np.zeros_like(zone)
     reference_saturation = float(np.median(saturation[zone]))
@@ -263,7 +355,7 @@ def detect(
     image: np.ndarray,
     config: PipelineConfig | None = None,
 ) -> DefectResult:
-
+    
     config = config or get_config()
     source_image = resize_to_limit(image, config.preprocess.max_dimension)
     image = preprocess(image, config.preprocess)
@@ -344,6 +436,24 @@ def detect(
         source_image, selection, texture_window
     )
 
+    if not is_blue_latex:
+        median_glove_intensity = float(np.median(intensity[selection]))
+        median_glove_saturation = float(np.median(saturation[selection]))
+        if (
+            median_glove_intensity > cfg.nitrile_max_glove_intensity
+            or median_glove_saturation > cfg.nitrile_max_glove_saturation
+        ):
+            return DefectResult(
+                False,
+                "plastic_contamination",
+                details=(
+                    "non-blue glove is outside the calibrated black Nitrile "
+                    "intensity/saturation range"
+                ),
+                debug_mask=np.zeros_like(segmentation.mask),
+                analysis_mask=detector_glove_mask,
+            )
+
     if is_blue_latex:
         finger_candidate = _zone_reference_candidate(
             finger_zone,
@@ -380,8 +490,9 @@ def detect(
         minimum_quality = None
         material_name = "blue Latex"
     else:
-
-
+        
+        
+        
         finger_zone, palm_zone, _cuff_zone = _zone_masks(
             analysis_support,
             segmentation.bbox,
@@ -404,7 +515,10 @@ def detect(
             minimum_pixels=cfg.minimum_analysis_pixels,
             intensity_gain=cfg.nitrile_palm_intensity_gain,
         )
-
+        
+        
+        
+        
         candidate_pixels = (
             (finger_candidate | palm_candidate)
             & (texture_ratio > cfg.nitrile_min_pixel_texture_ratio)
@@ -456,6 +570,15 @@ def detect(
         merge_gap=merge_gap,
         quality_image=texture_ratio,
         minimum_quality=minimum_quality,
+    )
+    kept_mask, locations, candidate_area = _filter_interior_regions(
+        kept_mask,
+        saturation,
+        intensity,
+        segmentation.bbox,
+        segmentation.area,
+        is_blue_latex=is_blue_latex,
+        config=config,
     )
     found = bool(locations)
     candidate_fraction = candidate_area / max(segmentation.area, 1.0)

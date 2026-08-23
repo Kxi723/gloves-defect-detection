@@ -2,17 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
 @dataclass
 class PreprocessConfig:
-
     max_dimension: int = 1024
     median_kernel: int = 3
 
 
 @dataclass
 class SegmentationConfig:
-
     border_fraction: float = 0.04
     min_area_fraction: float = 0.12
     max_area_fraction: float = 0.90
@@ -23,7 +20,6 @@ class SegmentationConfig:
 
 @dataclass
 class SkinColourConfig:
-
     red_min: int = 85
     green_min: int = 45
     blue_min: int = 25
@@ -36,21 +32,24 @@ class SkinColourConfig:
 
 @dataclass
 class FingerNotEnoughConfig:
-
     cuff_start_fraction: float = 0.84
     contact_kernel_fraction: float = 0.035
     min_component_pixels: int = 40
     min_component_fraction: float = 0.001
+    max_component_fraction: float = 0.009
+    fingertip_top_fraction: float = 0.32
+    fingertip_side_fraction: float = 0.12
+    min_component_width_fraction: float = 0.08
+    max_component_width_fraction: float = 0.18
+    max_component_height_fraction: float = 0.09
+    min_component_aspect: float = 0.85
+    max_component_aspect: float = 3.25
     min_exposed_area_fraction: float = 0.0022
-    marginal_area_ratio: float = 0.80
-    min_skeleton_branch_fraction: float = 0.010
     area_score_scale: float = 0.04
-    skeleton_score_scale: float = 0.12
 
 
 @dataclass
 class PlasticContaminationConfig:
-
     interior_kernel_fraction: float = 0.016
     texture_window_fraction: float = 0.015
     open_kernel_fraction: float = 0.003
@@ -60,12 +59,30 @@ class PlasticContaminationConfig:
     minimum_component_pixels: int = 40
     minimum_merge_pixels: int = 2
     score_fraction_scale: float = 0.10
-
+    
     finger_end_fraction: float = 0.48
     palm_end_fraction: float = 0.82
 
     blue_latex_ratio_threshold: float = 0.42
     knitted_texture_threshold: float = 18.0
+    
+    nitrile_max_glove_intensity: float = 125.0
+    nitrile_max_glove_saturation: float = 0.20
+    
+    region_min_width_fraction: float = 0.12
+    region_min_height_fraction: float = 0.08
+    region_centre_x_min_fraction: float = 0.18
+    region_centre_x_max_fraction: float = 0.82
+    region_centre_y_min_fraction: float = 0.36
+    region_centre_y_max_fraction: float = 0.82
+    region_max_area_fraction: float = 0.20
+    latex_min_region_median_saturation: float = 0.13
+    
+    nitrile_region_centre_y_min_fraction: float = 0.15
+    nitrile_min_region_median_saturation: float = 0.05
+    nitrile_max_region_median_saturation: float = 0.10
+    nitrile_min_region_median_intensity: float = 80.0
+    nitrile_max_region_median_intensity: float = 112.0
 
     blue_support_ratio: float = 0.39
     blue_support_red_multiplier: float = 1.12
@@ -103,18 +120,17 @@ class PlasticContaminationConfig:
 
 @dataclass
 class ImproperRollConfig:
-
     blue_latex_ratio_threshold: float = 0.42
     texture_window_fraction: float = 0.015
     cotton_texture_threshold: float = 18.0
     minimum_analysis_pixels: int = 100
-
+    
     cotton_mask_support_dilate_fraction: float = 0.035
     cotton_mask_vertical_close_fraction: float = 0.055
     cotton_mask_compact_close_fraction: float = 0.014
     cotton_mask_median_fraction: float = 0.009
     cotton_colour_min_component_pixels: int = 100
-
+    
     cotton_yellow_red_min: int = 115
     cotton_yellow_green_min: int = 85
     cotton_yellow_blue_max: int = 115
@@ -136,13 +152,16 @@ class ImproperRollConfig:
     skin_region_x_end_fraction: float = 0.90
     skin_region_y_start_fraction: float = 0.52
     skin_region_y_end_fraction: float = 1.12
-
+    
     nitrile_max_aspect: float = 1.35
     nitrile_normal_edge_score: float = 17.0
     nitrile_min_edge_increase: float = 8.0
     nitrile_min_edge_continuity: float = 0.10
     nitrile_edge_start_fraction: float = 0.65
     nitrile_edge_end_fraction: float = 0.93
+    nitrile_min_edge_y_fraction: float = 0.80
+    nitrile_max_glove_intensity: float = 125.0
+    nitrile_max_glove_saturation: float = 0.20
     nitrile_edge_pixel_threshold: float = 60.0
     nitrile_edge_x_start_fraction: float = 0.08
     nitrile_edge_x_end_fraction: float = 0.92
@@ -169,5 +188,7 @@ class PipelineConfig:
     )
     improper_roll: ImproperRollConfig = field(default_factory=ImproperRollConfig)
 
+
 def get_config() -> PipelineConfig:
+
     return PipelineConfig()

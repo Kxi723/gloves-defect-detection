@@ -135,6 +135,9 @@ class GloveInspector:
         "damage_by_fold": (0, 0, 255),
         "dirty": (0, 0, 255),
         "tearing_at_finger": (0, 0, 255),
+        "tearing": (0, 120, 255),
+        "incomplete_beading": (255, 0, 255),
+        "spotting": (0, 165, 255),
     }
 
     _EXTRA_COLORS = [(255, 255, 0), (0, 255, 255), (128, 0, 255), (0, 128, 0)]
@@ -147,28 +150,54 @@ class GloveInspector:
             color = self._EXTRA_COLORS[extra_index % len(self._EXTRA_COLORS)]
         return color
 
-    def annotate(self, report: InspectionReport, image: Optional[np.ndarray] = None) -> np.ndarray:
+    def annotate(self, report: InspectionReport, image: Optional[np.ndarray] = None,
+                 show_segmentation: bool = True) -> np.ndarray:
+        """Draw detector findings and the glove segmentation outline."""
         canvas = (image if image is not None else self._last_normalized).copy()
 
         if not report.segmentation_ok or report.segmentation is None:
-            cv2.putText(canvas, "SEGMENTATION FAILED", (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            cv2.putText(canvas, "SEGMENTATION FAILED", (12, 34),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
             return canvas
 
-        cv2.drawContours(canvas, [report.segmentation.contour], -1, (0, 255, 0), 2)
+        if show_segmentation:
+            cv2.drawContours(canvas, [report.segmentation.contour], -1,
+                             (0, 200, 0), 2)
 
         index = 0
         for extra_i, (name, result) in enumerate(report.results.items()):
             if not result.defect_found:
                 continue
             color = self._detector_color(result.defect_type, extra_i)
+
+            defect_mask = getattr(result, "debug_mask", None)
+            if defect_mask is None:
+                defect_mask = getattr(result, "mask", None)
+            if isinstance(defect_mask, np.ndarray) and defect_mask.size:
+                if defect_mask.ndim == 3:
+                    defect_mask = cv2.cvtColor(defect_mask, cv2.COLOR_BGR2GRAY)
+                if defect_mask.shape[:2] == canvas.shape[:2] and np.any(defect_mask > 0):
+                    active = defect_mask > 0
+                    tint = np.zeros_like(canvas)
+                    tint[:] = color
+                    blended = cv2.addWeighted(canvas, 0.72, tint, 0.28, 0)
+                    canvas[active] = blended[active]
+                    mask_u8 = np.where(active, 255, 0).astype(np.uint8)
+                    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL,
+                                                   cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(canvas, contours, -1, color, 2)
+
             for (x, y, w, h) in result.locations:
+                x, y, w, h = map(int, (x, y, w, h))
                 index += 1
                 cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 2)
                 tag = str(index)
                 (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 tx, ty = x, max(y - 4, th + 4)
-                cv2.rectangle(canvas, (tx, ty - th - 4), (tx + tw + 8, ty + 4), color, cv2.FILLED)
-                cv2.putText(canvas, tag, (tx + 4, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.rectangle(canvas, (tx, ty - th - 4),
+                              (tx + tw + 8, ty + 4), color, cv2.FILLED)
+                cv2.putText(canvas, tag, (tx + 4, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (255, 255, 255), 2)
         return canvas
 
     def render_report(self, report: InspectionReport, original: Optional[np.ndarray] = None) -> np.ndarray:
