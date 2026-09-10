@@ -25,6 +25,15 @@ class SegmentationConfig:
     illumination_border_fraction: float = 0.06
     background_mad_floor: float = 4.0
     background_z_clip: float = 8.0
+    edge_weight: float = 1.5
+    field_z: float = 5.0
+    field_trim: float = 0.75
+    field_subsample: int = 3
+    field_exclude_ratio: float = 0.12
+    refine_max_dimension: int = 480
+    refine_iterations: int = 3
+    refine_core_ratio: float = 0.20
+    refine_reach_ratio: float = 0.30
 
 @dataclass
 class DirtConfig:
@@ -216,30 +225,166 @@ def _fill_noise_holes(mask_raw: np.ndarray, solid: np.ndarray, cfg: Segmentation
             cv2.drawContours(result, [hc], -1, 255, thickness=cv2.FILLED)
     return result
 
+def _ellipse(radius: float) -> np.ndarray:
+    r = max(int(radius), 1)
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+def _equivalent_radius(mask: np.ndarray) -> float:
+    return float(np.sqrt(max(np.count_nonzero(mask), 1) / np.pi))
+
+def _largest_blob(mask: np.ndarray, cfg: SegmentationConfig) -> Optional[np.ndarray]:
+    cleaned = _morphological_cleanup(mask, cfg)
+    count, labels = cv2.connectedComponents(cleaned)
+    if count <= 1:
+        return None
+    largest = 1 + int(np.argmax([np.count_nonzero(labels == i) for i in range(1, count)]))
+    return np.where(labels == largest, 255, 0).astype(np.uint8)
+
+def _gradient_field(image: np.ndarray) -> np.ndarray:
+    gray = cv2.GaussianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32), (0, 0), 1.4)
+    return cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+
+def _edge_support(gradient: np.ndarray, solid: np.ndarray) -> float:
+    """Mean image gradient along the mask boundary, over the gradient scale of the
+    frame. An outline that follows the glove sits on real edges; one that wanders
+    into flat backdrop scores near zero."""
+    ring = cv2.subtract(solid, cv2.erode(solid, np.ones((3, 3), np.uint8)))
+    if np.count_nonzero(ring) < 20:
+        return 0.0
+    scale = max(float(np.percentile(gradient, 90)), 1e-6)
+    return float(np.mean(gradient[ring > 0])) / scale
+
+def _surface_terms(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    return np.stack([np.ones_like(x), x, y, x * x, y * y, x * y, x * x * y, x * y * y], axis=1)
+
+def _backdrop_residual_mask(image: np.ndarray, seed: np.ndarray, cfg: SegmentationConfig) -> Optional[np.ndarray]:
+    """Foreground as the residual from a smooth surface fitted to the backdrop.
+
+    Sampling only the frame border treats the cloth as one flat colour. A lamp
+    puts a bright halo around the glove and lets the corners fall away, so the
+    middle of the cloth ends up far from the border median and reads as glove.
+    Fitting a low order surface to the pixels that are actually backdrop predicts
+    that falloff instead, and only real material is left over."""
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    height, width = lab.shape[:2]
+    grown = cv2.dilate(seed, _ellipse(cfg.field_exclude_ratio * _equivalent_radius(seed)))
+    sample = np.zeros((height, width), dtype=bool)
+    sample[::cfg.field_subsample, ::cfg.field_subsample] = True
+    sample &= grown == 0
+    flat = sample.ravel()
+    if int(np.count_nonzero(flat)) < 200:
+        return None
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    xx = xx / max(width - 1, 1) * 2.0 - 1.0
+    yy = yy / max(height - 1, 1) * 2.0 - 1.0
+    terms = _surface_terms(xx.ravel(), yy.ravel())
+    rows = terms[flat]
+
+    squared = np.zeros((height, width), dtype=np.float32)
+    for channel in range(3):
+        target = lab[:, :, channel].ravel()[flat]
+        coefficients, *_ = np.linalg.lstsq(rows, target, rcond=None)
+        residual = np.abs(rows @ coefficients - target)
+        keep = residual <= np.quantile(residual, cfg.field_trim)
+        if int(np.count_nonzero(keep)) > 100:
+            coefficients, *_ = np.linalg.lstsq(rows[keep], target[keep], rcond=None)
+            residual = np.abs(rows @ coefficients - target)
+        spread = max(float(np.median(residual)) * 1.4826, 2.0)
+        surface = (terms @ coefficients).reshape(height, width)
+        squared += ((lab[:, :, channel] - surface) / spread) ** 2
+    distance = np.sqrt(squared / 3.0)
+    return (distance > cfg.field_z).astype(np.uint8) * 255
+
+def _grabcut_refine(image: np.ndarray, coarse: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
+    """Re-cut the boundary with GrabCut, at reduced resolution.
+
+    The seed says roughly where the glove is; the graph cut then decides the edge
+    from the colour statistics of both sides, which is what drops a sleeve or an
+    arm that the thresholds had joined onto the glove."""
+    height, width = coarse.shape[:2]
+    scale = min(1.0, cfg.refine_max_dimension / max(height, width))
+    size = (max(int(round(width * scale)), 16), max(int(round(height * scale)), 16))
+    small_image = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+    small = cv2.resize(coarse, size, interpolation=cv2.INTER_NEAREST)
+    if np.count_nonzero(small) < 40:
+        return coarse
+
+    radius = _equivalent_radius(small)
+    core = cv2.erode(small, _ellipse(cfg.refine_core_ratio * radius))
+    if np.count_nonzero(core) < 20:
+        return coarse
+    reach = cv2.dilate(small, _ellipse(cfg.refine_reach_ratio * radius))
+
+    state = np.full(small.shape, cv2.GC_BGD, np.uint8)
+    state[reach > 0] = cv2.GC_PR_BGD
+    state[small > 0] = cv2.GC_PR_FGD
+    state[core > 0] = cv2.GC_FGD
+    band = max(2, int(round(min(size) * cfg.border_fraction)))
+    edge = np.zeros(small.shape, dtype=bool)
+    edge[:band, :] = True
+    edge[-band:, :] = True
+    edge[:, :band] = True
+    edge[:, -band:] = True
+    state[edge & (small == 0)] = cv2.GC_BGD
+
+    try:
+        cv2.grabCut(small_image, state, None, np.zeros((1, 65), np.float64),
+                    np.zeros((1, 65), np.float64), cfg.refine_iterations, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return coarse
+    refined = np.where((state == cv2.GC_FGD) | (state == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    if np.count_nonzero(refined) < 0.25 * np.count_nonzero(small):
+        return coarse  # the cut collapsed, keep the seed
+    return cv2.resize(refined, (width, height), interpolation=cv2.INTER_NEAREST)
+
 def segment_glove(image: np.ndarray, config: Optional[SegmentationConfig] = None) -> Optional[SegmentationResult]:
     cfg = config or SegmentationConfig()
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    candidates: List[Tuple[str, np.ndarray]] = [("bg_distance", _background_distance_mask(lab, cfg.border_fraction)),]
     otsu_masks = _channel_otsu_masks(hsv)
-    candidates.append(("saturation", otsu_masks[0]))
-    candidates.append(("value", otsu_masks[1]))
-    candidates.append(("value_inverted", otsu_masks[2]))
-    candidates.append(("texture", _texture_energy_mask(image, cfg.texture_window)))
-    primary = _background_model_mask(image, cfg)
-    if _score_candidate(primary, cfg) >= 0:
-        best_cue, best_mask = "bg_model", primary
-    else:
-        scored = [(_score_candidate(mask, cfg), name, mask) for name, mask in candidates]
-        best_score, best_cue, best_mask = max(scored, key=lambda triple: triple[0])
-        if best_score < 0:
-            return None
-    cleaned = _morphological_cleanup(best_mask, cfg)
-    num, labels = cv2.connectedComponents(cleaned)
-    if num <= 1:
+    candidates: List[Tuple[str, np.ndarray]] = [
+        ("bg_model", _background_model_mask(image, cfg)),
+        ("bg_distance", _background_distance_mask(lab, cfg.border_fraction)),
+        ("saturation", otsu_masks[0]),
+        ("value", otsu_masks[1]),
+        ("value_inverted", otsu_masks[2]),
+        ("texture", _texture_energy_mask(image, cfg.texture_window)),
+    ]
+
+    # every cue is scored on area, compactness and how well its outline lands on
+    # real image edges, and the best one wins
+    gradient = _gradient_field(image)
+    best_score, best_cue, best_mask = 0.0, "", None
+    for name, mask in candidates:
+        score = _score_candidate(mask, cfg)
+        if score < 0:
+            continue
+        blob = _largest_blob(mask, cfg)
+        if blob is not None:
+            solid, contour = _keep_largest_component(blob)
+            if contour is not None:
+                score += cfg.edge_weight * _edge_support(gradient, solid)
+        if best_mask is None or score > best_score:
+            best_score, best_cue, best_mask = score, name, mask
+    if best_mask is None:
         return None
-    largest_label = 1 + int(np.argmax([np.count_nonzero(labels == i) for i in range(1, num)]))
-    component = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+
+    component = _largest_blob(best_mask, cfg)
+    if component is None:
+        return None
+
+    # second pass, now that the glove is roughly located the backdrop can be modelled
+    residual = _backdrop_residual_mask(image, component, cfg)
+    if residual is not None and _score_candidate(residual, cfg) > -1.0:
+        refined = _largest_blob(residual, cfg)
+        if refined is not None:
+            component = refined
+
+    cut = _largest_blob(_grabcut_refine(image, component, cfg), cfg)
+    if cut is not None:
+        component = cut
+
     solid, contour = _keep_largest_component(component)
     if contour is None:
         return None
@@ -247,7 +392,7 @@ def segment_glove(image: np.ndarray, config: Optional[SegmentationConfig] = None
     if area < cfg.min_area_fraction * image.shape[0] * image.shape[1]:
         return None
     mask_raw = _fill_noise_holes(component, solid, cfg, area)
-    return SegmentationResult(mask=solid, mask_raw=mask_raw, contour=contour, bbox=cv2.boundingRect(contour), area=float(area), cue=best_cue,)
+    return SegmentationResult(mask=solid, mask_raw=mask_raw, contour=contour, bbox=cv2.boundingRect(contour), area=float(area), cue=best_cue)
 
 def palm_center_and_radius(mask: np.ndarray) -> Tuple[Tuple[int, int], float]:
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)

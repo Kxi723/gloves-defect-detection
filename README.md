@@ -1,111 +1,118 @@
-# Gloves Defect Detection (GDD)
+# Glove Defect Detection System
 
-CT036-3-IPPR group assignment. Classical image processing only (OpenCV +
-NumPy) — no deep learning, Haar cascades, or template matching.
-
-> Work in progress. Three of the twelve defects are implemented; the
-> README will be rewritten once the full set is in.
+Three glove defects found with classical image processing (OpenCV and NumPy, no
+training data). Damage by fold, dirty, and tearing at the fingertip.
 
 ## Run it
 
 ```bash
-C:\Tool\python\python.exe app.py
+C:\Tool\python\python.exe studio.py
 ```
 
-```bash
-C:\Tool\python\python.exe test_pipeline.py
+The launcher has one card per defect. Picking one runs every photo in `gloves/`
+straight away and replays the detector one step at a time, so the preprocessing,
+the segmentation and the analysis are on screen rather than implied.
+
+```
+capture -> resize -> white balance -> bilateral
+        -> background distance -> cue vote -> cleanup -> largest component
+        -> backdrop surface -> GrabCut -> glove found
+        -> the analysis steps of that defect -> verdict
 ```
 
-```bash
-C:\Tool\python\python.exe evaluate.py
-```
+Fold plays 22 steps, dirty 18 and tear 19. The source photo stays on the left
+and the current step sweeps in on the right. Every photo is processed once. The
+folder list on the right keeps each finished photo with its verdict, and clicking
+one opens it for reading on its verdict frame without running the detector again.
+The live run holds meanwhile, and clicking the live row (or play, or Space)
+resumes it where it was left. The pipeline strip underneath scrubs to any step,
+the arrow buttons and keys walk through the finished photos, and SAVE writes the
+frame on screen to `output/<defect>/`. Esc returns to the launcher.
 
-`app.py` is the UI. It has two pages. The inspect page picks a defect on
-the left, the photos in the middle and lists a result per photo on the
-right. The compare page shows the original and the detected photo side by
-side at the same scale, with a filmstrip of the run underneath, and it can
-save the pair as one PNG for the report. Open it by double-clicking a
-result row or by clicking the small preview. Left and Right walk through
-the run and Esc goes back.
+Frames play at a fixed pace. The detector itself runs at full speed in a
+background thread, about 0.6s a photo on its own and 1.3s with every frame
+rendered, so it always stays ahead of the playback.
 
-`test_pipeline.py` runs a whole folder and writes
-report figures (original | mask | detection) to `output/`. `evaluate.py`
-prints precision and recall per detector, reading the ground truth from
-the filename (`kxi_latex_3.jpeg` → latex → should find `damage_by_fold`).
-
-Photos live in `gloves/`. Use the full interpreter path — a bare `python`
-hits the Microsoft Store stub.
+Photos live in `gloves/`, named `Fold_*`, `Dirty_*` or `TearFinger_*` after the
+defect they should show. Use the full interpreter path, a bare `python` hits the
+Microsoft Store stub.
 
 ## Layout
 
 ```
-app.py          UI, two pages        ui/     UI toolkit + compare page
-detectors/      one self-contained file per defect
-runner.py       local test host      test_pipeline.py, evaluate.py
+studio.py         entry point
+ui/studio.py      launcher and run screen      ui/neon.py   look and drawing helpers
+pipeline.py       step tracing, calls each detector's own functions
+detectors/        one self contained file per defect
+runner.py         headless harness, used by evaluate.py
+gloves/           the photos
 ```
 
-**Each file in `detectors/` is standalone.** It carries its own
-preprocessing, segmentation, measurement helpers and thresholds, and
-imports nothing from this project — so it can be dropped into the group's
-shared UI, or any other host, on its own.
+**Each file in `detectors/` is standalone.** It carries its own preprocessing,
+segmentation, measurement helpers and thresholds, and imports nothing from the
+project. `pipeline.py` only calls into those modules and captures what they
+produce, so the verdict on screen always comes from the detector's own `detect`.
 
-That means the same front-end code appears in every detector file. This is
-deliberate. The group photographs gloves under different angles and
-lighting, so each defect needs to tune its own preprocessing and
-segmentation; one shared version would force a single compromise on all of
-them. The cost is that a fix to shared plumbing has to be applied per file.
+## How the glove is separated from the backdrop
 
-`runner.py` is NOT part of that contract. It is the local harness that
-`app.py`, `test_pipeline.py` and `evaluate.py` share, so the three behave
-identically: it drives detector modules, collects results, and draws the
-annotated photos and report figures.
+`segment_glove` in each module runs three passes.
 
-## Adding a detector
+1. **Cue vote.** Six ways of calling background (a border sampled background
+   model, Lab distance from the backdrop, three Otsu splits on HSV, and a texture
+   energy map) are each scored on area, compactness, how much filling the outline
+   needed, and how well that outline lands on real image edges. The edge term is
+   what stops a mask whose boundary wanders through flat cloth from winning.
+2. **Backdrop surface.** With the glove roughly located, a low order surface is
+   fitted per Lab channel to the pixels that are actually backdrop. Sampling only
+   the frame border treats the cloth as one flat colour, but the lamp puts a
+   bright halo around the glove and lets the corners fall away, so the middle of
+   the cloth sits far from the border median and reads as glove. Fitting the
+   falloff predicts it instead, and only real material is left over.
+3. **GrabCut.** The boundary is re cut at reduced resolution from the colour
+   statistics of both sides, which is what drops a sleeve or a forearm that the
+   thresholds had joined onto the glove.
 
-Write one self-contained file in `detectors/` exposing one function, then
-append a `DefectSpec` to `DEFECTS` in `detectors/__init__.py`. Nothing else
-in the project changes.
+## How each defect is decided
 
-```python
-def detect(image) -> DefectResult: ...
-```
+**Fold.** Three channels look for a dark line in the palm (shading ridge, weave
+bend, chroma residual). A shadow gate drops anything brighter than the glove,
+which is glare on a flat sheet. A span gate then asks for the line to run across
+the palm, at least 1.33 palm radii once extended along its own direction, because
+a fold is pressed across the palm while a natural wrinkle or a knit stripe is a
+short line. On these photos the shortest real fold spans 1.44R and the longest
+wrinkle 1.23R, and the gate sits between them.
 
-`image` is a raw BGR photo straight from `cv2.imread`; the module does its
-own preprocessing and segmentation. Expose `Config`, `preprocess` and
-`segment_glove` as well and `runner.py` will drive that front end itself,
-which saves running it twice and lets a report figure show the mask your
-detector actually saw.
+**Dirty.** Blobs whose lightness is off from the glove itself, deep enough inside
+the glove to rule out rim shading, are kept when they are texture free (something
+covers the weave) or carry a hue the glove never shows.
 
-Two conventions that matter, because the marker will use photos we have
-never seen:
-
-- Express thresholds as fractions of the palm radius or glove area, never
-  in pixels, so they survive a change of camera or framing.
-- Take reference levels from the glove in the photo itself (robust median
-  and MAD) rather than hard-coding them, so they adapt to colour, material
-  and lighting.
+**Tearing at fingertip.** Fingertips come from the hand skeleton. Holes, show
+through patches and contour notches only count when they land inside a ring
+around a tip.
 
 ## Current state
 
-| detector | file | precision | recall |
-|---|---|---|---|
-| Damage by Fold | `detectors/damage_by_fold.py` | 67% | 80% |
-| Dirty | `detectors/dirty.py` | 83% | 100% |
-| Tearing (fingertip) | `detectors/tearing_at_finger.py` | 100% | 20% |
+| detector | agrees with the filename |
+|---|---|
+| Damage by Fold | 15 of 15 |
+| Dirty | 15 of 15 |
+| Tearing at Fingertip | 15 of 15 |
 
-Measured by `evaluate.py` over 15 photos. Two caveats it prints itself:
-there are no undamaged-glove photos yet, so precision only reflects
-confusion with the other defect types; and the low tearing recall is a
-capture problem, not an algorithm one — four of the five torn gloves were
-photographed while worn, where a fingertip tear barely changes the
-silhouette.
+Every detector is run on every photo, so a clean photo firing counts as a miss.
+The 15 photos are the whole data set, used both to tune and to demo, so this is
+not a held out number. Thresholds sit on measured gaps rather than on a single
+image wherever that was possible. There are no undamaged glove photos yet, so a
+false alarm can only be caught against the other two defect types.
 
 **Photograph the glove flat and empty, whole glove inside the frame.**
 
-## Working on it
+## Adding a detector
 
-Run `evaluate.py` after every change to see whether accuracy moved, then
-`test_pipeline.py` to check the boxes landed in the right places. Numbers
-alone mislead — a mask can score a plausible area while covering the wrong
-region — and pictures alone cannot tell you whether a change helped
-overall.
+Write one self contained file in `detectors/` exposing `Config`, `preprocess`,
+`segment_glove` and `detect`, add it to `DEFECTS` in `detectors/__init__.py`, and
+add a card for it to `DEFECTS` in `pipeline.py` together with its analysis steps.
+
+Express thresholds as fractions of the palm radius or of the glove area, never in
+pixels, so they survive a change of camera or framing. Take reference levels from
+the glove in the photo itself (robust median and MAD) rather than hard coding
+them, so they adapt to colour, material and lighting.
