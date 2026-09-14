@@ -1,44 +1,43 @@
 """Glove Defect Detection System.
 
-Two screens. The launcher offers the three defects, and picking one starts a run
-over every photo in the gloves folder, replaying each detector one step at a time so
-the preprocessing and the segmentation are visible rather than implied.
+Two screens in one industrial QC floor look (see ui/qc.py). The line screen offers
+the three detectors, and picking one opens the inspect screen, which runs the
+detector over every photo in the gloves folder and replays each one a step at a
+time, so the preprocessing and the segmentation are visible rather than implied.
+Finished photos stay in the batch strip and reopen for reading without the
+detector running again, and they are kept when you go back to the line screen.
 """
 from __future__ import annotations
 
-import math
 import queue
-import random
+import re
 import threading
 import time
 import tkinter as tk
-import tkinter.font as tkfont
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageTk
 
 import pipeline
-from pipeline import DEFECTS, DefectSpec, Stage, Trace
+from pipeline import DefectSpec, Stage, Trace
 from ui import neon
+from ui.qc import (DETECTORS, DIM, DIM_2, INK, INK_2, MARK, PANE, PAPER, PASS, REJECT, RULE,
+                   TITLE, LineScreen, clip, cover, font, letterbox, mix, px, stripes)
 
 TICK_MS = 33
 STAGE_DWELL_MS = 520
 VERDICT_DWELL_MS = 1700
-APP_TITLE = "GLOVE DEFECT DETECTION SYSTEM"
 PLAYBACK_SPEED = 2.0  # frames play at twice the base dwell, the detector always runs flat out
 
-
-def _clip(text: str, measure: "tkfont.Font", room: int) -> str:
-    """Single line, cut with an ellipsis rather than wrapped."""
-    if measure.measure(text) <= room:
-        return text
-    trimmed = text
-    while trimmed and measure.measure(trimmed + "…") > room:
-        trimmed = trimmed[:-1]
-    return trimmed + "…"
+PHASE_NAMES = {"preprocess": "Preprocess", "segmentation": "Segment glove",
+               "analysis": "Analyse", "verdict": "Verdict"}
+PHASE_NOTES = {"preprocess": "Resize · balance · denoise", "segmentation": "Cue vote · GrabCut",
+               "verdict": "Decide · mark"}
+ANALYSIS_NOTES = {"fold": "Shading · weave · residual", "dirty": "Outliers · texture · hue",
+                  "tear": "Tips · holes · show-through"}
 
 
 # --------------------------------------------------------------------- engine
@@ -136,19 +135,20 @@ class Studio:
         self.root = root
         neon.enable_hidpi()
         neon.apply_scaling(root)
-        root.title(APP_TITLE.title())
-        root.configure(bg=neon.VOID)
-        root.minsize(neon.px(1180), neon.px(740))
-        self._centre(neon.px(1420), neon.px(900))
+        root.title(TITLE)
+        root.configure(bg=INK)
+        root.minsize(px(1180), px(740))
+        self._centre(px(1440), px(900))
 
         self.animator = Animator(root)
         self.animator.start()
 
         self.photos: List[Path] = pipeline.photos_in()
-        self.container = tk.Frame(root, bg=neon.VOID)
+        self.store: Dict[str, dict] = {}   # what each detector has finished, kept across visits
+        self.container = tk.Frame(root, bg=INK)
         self.container.pack(fill="both", expand=True)
 
-        self.home = HomeScreen(self, self.container)
+        self.home = LineScreen(self, self.container)
         self.run: Optional[RunScreen] = None
         self.show_home()
 
@@ -174,338 +174,90 @@ class Studio:
             return
         self.home.sleep()
         self.home.place_forget()
-        self.run = RunScreen(self, self.container, spec, self.photos)
+        self.run = RunScreen(self, self.container, spec, self.photos, self.store.get(spec.slug))
         self.run.place(in_=self.container, relx=0, rely=0, relwidth=1, relheight=1)
 
 
-# ----------------------------------------------------------------------- home
-
-class HomeScreen(tk.Canvas):
-    CARD_W, CARD_H, GAP = 300, 254, 30
-
-    def __init__(self, app: Studio, parent: tk.Widget) -> None:
-        super().__init__(parent, bg=neon.VOID, highlightthickness=0, bd=0)
-        self.app = app
-        self._backdrop = None
-        self._particles = []
-        self._cards: List[dict] = []
-        self._hover = -1
-        self._phase = 0.0
-        self._empty_flash = 0.0
-        self._size = (0, 0)
-        self.bind("<Configure>", self._on_resize)
-        self.bind("<Motion>", self._on_motion)
-        self.bind("<Leave>", lambda _e: self._set_hover(-1))
-        self.bind("<Button-1>", self._on_click)
-
-    # -- lifecycle
-
-    def wake(self) -> None:
-        self.app.animator.add(self._tick)
-
-    def sleep(self) -> None:
-        self.app.animator.remove(self._tick)
-
-    # -- layout
-
-    def _on_resize(self, event) -> None:
-        if (event.width, event.height) == self._size:
-            return
-        self._size = (event.width, event.height)
-        self._rebuild()
-
-    def _rebuild(self) -> None:
-        self.delete("all")
-        width, height = self._size
-        if width < 40 or height < 40:
-            return
-
-        self._ground = neon.backdrop_image(width, height, neon.CYAN)
-        self._backdrop = neon.backdrop(width, height, neon.CYAN)
-        self.create_image(0, 0, image=self._backdrop, anchor="nw", tags="bg")
-
-        self._seed_particles(width, height)
-        for particle in self._particles:
-            particle["id"] = self.create_oval(0, 0, 0, 0, outline="", fill=particle["colour"])
-
-        cards_w = neon.px(3 * self.CARD_W + 2 * self.GAP)
-        scale = min((width - neon.px(70)) / cards_w,
-                    (height - neon.px(190)) / neon.px(self.CARD_H))
-        scale = max(min(scale, 1.0), 0.55)
-        card_w = int(neon.px(self.CARD_W) * scale)
-        card_h = int(neon.px(self.CARD_H) * scale)
-        gap = int(neon.px(self.GAP) * scale)
-        total = 3 * card_w + 2 * gap
-        left = (width - total) // 2
-
-        head_h = int(neon.px(92) * scale)
-        block = head_h + card_h
-        head_y = max((height - block) // 2, neon.px(24))
-        top = head_y + head_h
-
-        size = int(30 * scale)
-        room = width - neon.px(60)
-        while size > 11 and tkfont.Font(font=neon.font(size, "wide")).measure(APP_TITLE) > room:
-            size -= 1
-        self.create_text(width // 2, head_y + int(neon.px(24) * scale), text=APP_TITLE,
-                         font=neon.font(size, "wide"), fill=neon.INK, tags="head")
-
-        self._cards = []
-        for index, spec in enumerate(DEFECTS):
-            x = left + index * (card_w + gap)
-            self._cards.append(self._build_card(spec, index, x, top, card_w, card_h, scale))
-
-        if not self.app.photos:  # the only case where the folder is worth mentioning
-            self.create_text(width // 2, min(top + card_h + int(neon.px(38) * scale),
-                                             height - neon.px(22)),
-                             text="no photos in  gloves/", font=neon.font(int(9 * scale), "mono"),
-                             fill=neon.RED, tags=("foot",))
-
-    def _build_card(self, spec: DefectSpec, index: int, x: int, y: int,
-                    width: int, height: int, scale: float) -> dict:
-        tag = "card{}".format(index)
-        body = "cardtext{}".format(index)
-        card = {"spec": spec, "tag": tag, "body": body, "box": (x, y, width, height),
-                "hover": 0.0, "images": {}, "scale": scale, "lift": 0,
-                "ground": self._ground.crop((x, max(y - neon.px(4), 0),
-                                             x + width, max(y - neon.px(4), 0) + height))}
-        image = self._card_image(card, 0.0)
-        card["images"][0.0] = image
-        card["image_id"] = self.create_image(x, y, image=image, anchor="nw", tags=(tag, "card"))
-
-        centre = x + width // 2
-        unit = lambda value: int(neon.px(value) * scale)  # noqa: E731
-        card["icon_y"] = unit(101)
-        card["icon_size"] = unit(118)
-        icon = neon.glyph(spec.slug, card["icon_size"], spec.accent, self._card_fill(spec, 0.0))
-        card["icon"] = icon
-        card["icon_id"] = self.create_image(centre, y + card["icon_y"], image=icon,
-                                            anchor="center", tags=(tag, "card"))
-        card["chip_id"] = self.create_text(centre, y + unit(201), text=spec.title,
-                                           font=neon.font(int(15 * scale), "wide"),
-                                           fill=neon.INK, tags=(tag, body, "card"))
-        return card
-
-    @staticmethod
-    def _card_fill(spec: DefectSpec, strength: float) -> str:
-        return neon.mix(neon.PANEL, spec.glow, 0.34 + 0.42 * strength)
-
-    def _card_image(self, card: dict, strength: float):
-        spec = card["spec"]
-        return neon.glow_panel_on(card["ground"], radius=neon.px(18),
-                                  fill=self._card_fill(spec, strength),
-                                  border=neon.mix(neon.LINE_HI, spec.accent, 0.30 + 0.70 * strength),
-                                  glow=spec.accent, strength=strength, inset=neon.px(15))
-
-    # -- particles
-
-    def _seed_particles(self, width: int, height: int) -> None:
-        self._particles = []
-        for _ in range(46):
-            self._particles.append({
-                "x": random.uniform(0, width),
-                "y": random.uniform(0, height),
-                "vx": random.uniform(-14, 14),
-                "vy": random.uniform(-26, -6),
-                "r": random.uniform(0.8, 2.4),
-                "colour": neon.fade(random.choice((neon.CYAN, neon.VIOLET, neon.INK)),
-                                    random.uniform(0.10, 0.34), neon.VOID),
-                "id": None,
-            })
-
-    # -- animation
-
-    def _tick(self, delta: float) -> None:
-        width, height = self._size
-        if width < 40:
-            return
-        self._phase += delta
-        for particle in self._particles:
-            particle["x"] += particle["vx"] * delta
-            particle["y"] += particle["vy"] * delta
-            if particle["y"] < -6:
-                particle["y"] = height + 6
-                particle["x"] = random.uniform(0, width)
-            if particle["x"] < -6:
-                particle["x"] = width + 6
-            elif particle["x"] > width + 6:
-                particle["x"] = -6
-            r = particle["r"]
-            self.coords(particle["id"], particle["x"] - r, particle["y"] - r,
-                        particle["x"] + r, particle["y"] + r)
-
-        for index, card in enumerate(self._cards):
-            target = 1.0 if index == self._hover else 0.0
-            current = card["hover"]
-            if abs(current - target) < 0.01:
-                card["hover"] = target
-            else:
-                card["hover"] = current + (target - current) * min(1.0, delta * 9.0)
-            self._paint_card(card)
-
-    def _paint_card(self, card: dict) -> None:
-        x, y, width, height = card["box"]
-        level = round(card["hover"] * 4) / 4.0
-        image = card["images"].get(level)
-        if image is None:
-            image = self._card_image(card, level)
-            card["images"][level] = image
-        self.itemconfigure(card["image_id"], image=image)
-
-        lift = int(card["hover"] * neon.px(7))
-        self.coords(card["image_id"], x, y - lift)
-        breathe = math.sin(self._phase * 3.1) * neon.px(2) * card["hover"]
-        icon = neon.glyph(card["spec"].slug, card["icon_size"], card["spec"].accent,
-                          self._card_fill(card["spec"], level))
-        card["icon"] = icon
-        self.itemconfigure(card["icon_id"], image=icon)
-        self.coords(card["icon_id"], x + width // 2, y + card["icon_y"] - lift + breathe)
-        if lift != card["lift"]:
-            self.move(card["body"], 0, card["lift"] - lift)
-            card["lift"] = lift
-        self.itemconfigure(card["chip_id"],
-                           fill=neon.mix(neon.INK, card["spec"].accent, card["hover"]))
-
-    # -- input
-
-    def _card_at(self, x: int, y: int) -> int:
-        for index, card in enumerate(self._cards):
-            cx, cy, width, height = card["box"]
-            if cx <= x <= cx + width and cy - 10 <= y <= cy + height:
-                return index
-        return -1
-
-    def _on_motion(self, event) -> None:
-        self._set_hover(self._card_at(event.x, event.y))
-
-    def _set_hover(self, index: int) -> None:
-        if index == self._hover:
-            return
-        self._hover = index
-        self.configure(cursor="hand2" if index >= 0 else "")
-
-    def _on_click(self, event) -> None:
-        index = self._card_at(event.x, event.y)
-        if index >= 0:
-            self.app.start_run(self._cards[index]["spec"])
-
-    def flash_empty(self) -> None:
-        self.itemconfigure("foot", fill=neon.RED)
-
-
-# ------------------------------------------------------------------ run screen
+# -------------------------------------------------------------- inspect screen
 
 class RunScreen(tk.Frame):
-    """Left plays the photo being processed live, the folder list keeps every
-    finished photo, and picking one of those opens it for reading without running
-    the detector again."""
+    """The main pane plays the photo being processed live, the batch strip keeps
+    every finished photo, and picking one of those opens it for reading without
+    running the detector again. Everything is drawn on one canvas, each region
+    under its own tag so it can be redrawn alone."""
 
-    SIDE_W = 348
-    TOP_H = 76
-    TIMELINE_H = 96
-    BOTTOM_H = 104
+    RAIL_W = 384
+    FILM_H = 108
 
-    def __init__(self, app: Studio, parent: tk.Widget, spec: DefectSpec, paths: List[Path]) -> None:
-        super().__init__(parent, bg=neon.BASE)
+    def __init__(self, app: Studio, parent: tk.Widget, spec: DefectSpec, paths: List[Path],
+                 saved: Optional[dict] = None) -> None:
+        super().__init__(parent, bg=INK)
         self.app = app
         self.spec = spec
         self.paths = paths
-        self.accent = spec.accent
+        self.name = DETECTORS.get(spec.slug, (spec.title, "", ""))[0]
 
-        self.traces: Dict[int, Trace] = {}
-        self.summary: Dict[int, dict] = {}
-        self.live = 0              # the photo the run is working through
-        self.index = 0             # the photo on screen
+        self.traces: Dict[int, Trace] = dict(saved["traces"]) if saved else {}
+        self.summary: Dict[int, dict] = dict(saved["summary"]) if saved else {}
+        pending = [i for i in range(len(paths)) if i not in self.summary]
+        self.complete = not pending
+        self.live = pending[0] if pending else len(paths) - 1   # the photo the run is working through
+        self.index = self.live     # the photo on screen
         self.stage_i = -1          # the frame on screen
         self.reviewing = False     # True while reading a finished photo
-        self.complete = False
-        self.playing = True
+        self.playing = not self.complete
         self.speed = PLAYBACK_SPEED
         self._live_stage = -1      # where the live photo was left when review began
         self._dwell_left = 0.0
         self._elapsed = 0.0
         self._pulse = 0.0
+        self._closed = False
         self._log: List[dict] = []
         self._reveal = 1.0
-        self._reveal_from: Optional[Image.Image] = None
-        self._reveal_to: Optional[Image.Image] = None
-        self._labels = ("", "", "", "")
-        self._labels_prev = None
-        self._frame_photo = None
-        self._current_pil: Optional[Image.Image] = None
-        self._thumbs: Dict[int, tuple] = {}
-        self._thumb_cache: Dict[int, np.ndarray] = {}
+        self._reveal_from: Optional[np.ndarray] = None
+        self._reveal_to: Optional[np.ndarray] = None
+        self._current: Optional[np.ndarray] = None
+        self._labels = ("", "")
+        self._labels_prev: Optional[tuple] = None
+        self._geo_cache: Optional[tuple] = None
+        self._images: Dict[str, object] = {}
         self._source_cache: Dict[int, np.ndarray] = {}
-        self._film_offset = 0.0
-        self._film_follow = True
+        self._previews: Dict[int, np.ndarray] = {}
+        self._cache: Dict[tuple, ImageTk.PhotoImage] = {}
+        self._hits: Dict[str, list] = {}
+        self._hover = ""
+        self._ref_index = -1
+        self._prog = None
         self._film_dirty = True
-        self._top_stamp = -1
-        self._hover_button = ""
-        self._bar_value = 0.0
+        self._bar_value = len(self.summary) / max(len(paths), 1)
 
-        self.worker = TraceWorker(spec, paths)
-        self._build()
-        self.worker.ensure(0, self.traces)
-        self.worker.ensure(1, self.traces)
-        self._log_line("studio", "loaded {} photo(s) from gloves/".format(len(paths)))
-        self._log_line("studio", "detector {}".format(spec.module))
-        self.app.animator.add(self._tick)
-        self._poll = self.after(60, self._drain)
-
-    # -- construction
-
-    def _build(self) -> None:
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-        self.top = tk.Canvas(self, bg=neon.BASE, highlightthickness=0, bd=0,
-                             height=neon.px(self.TOP_H))
-        self.top.grid(row=0, column=0, columnspan=2, sticky="ew")
-        self.top.bind("<Configure>", lambda _e: self._paint_top())
-        self.top.bind("<Button-1>", self._on_top_click)
-        self.top.bind("<Motion>", self._on_top_motion)
-
-        self.viewport = tk.Canvas(self, bg=neon.PANEL_SOFT, highlightthickness=0, bd=0)
-        self.viewport.grid(row=1, column=0, sticky="nsew",
-                           padx=(neon.px(18), neon.px(10)), pady=(0, neon.px(8)))
-        self.viewport.bind("<Configure>", lambda _e: self._on_viewport_resize())
-
-        self.timeline = tk.Canvas(self, bg=neon.BASE, highlightthickness=0, bd=0,
-                                  height=neon.px(self.TIMELINE_H))
-        self.timeline.grid(row=2, column=0, sticky="ew", padx=(neon.px(18), neon.px(10)))
-        self.timeline.bind("<Configure>", lambda _e: self._paint_timeline())
-        self.timeline.bind("<Button-1>", self._on_timeline_click)
-
-        side = tk.Frame(self, bg=neon.BASE, width=neon.px(self.SIDE_W))
-        side.grid(row=1, column=1, rowspan=2, sticky="nsew", padx=(0, neon.px(18)))
-        side.grid_propagate(False)
-        side.grid_rowconfigure(0, weight=3)
-        side.grid_rowconfigure(1, weight=2)
-        side.grid_columnconfigure(0, weight=1)
-
-        self.film = tk.Canvas(side, bg=neon.BASE, highlightthickness=0, bd=0)
-        self.film.grid(row=0, column=0, sticky="nsew", pady=(0, neon.px(10)))
-        self.film.bind("<Configure>", lambda _e: self._paint_film())
-        self.film.bind("<Button-1>", self._on_film_click)
-        self.film.bind("<Motion>", self._on_film_motion)
-        self.film.bind("<MouseWheel>", self._on_film_wheel)
-
-        self.telemetry = tk.Canvas(side, bg=neon.BASE, highlightthickness=0, bd=0)
-        self.telemetry.grid(row=1, column=0, sticky="nsew", pady=(0, neon.px(14)))
-        self.telemetry.bind("<Configure>", lambda _e: self._paint_log())
-
-        self.bottom = tk.Canvas(self, bg=neon.BASE, highlightthickness=0, bd=0,
-                                height=neon.px(self.BOTTOM_H))
-        self.bottom.grid(row=3, column=0, columnspan=2, sticky="ew")
-        self.bottom.bind("<Configure>", lambda _e: self._paint_bottom())
-        self.bottom.bind("<Button-1>", self._on_bottom_click)
-        self.bottom.bind("<Motion>", self._on_bottom_motion)
-
+        self.canvas = tk.Canvas(self, bg=INK, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _e: self._on_resize())
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Leave>", lambda _e: self._set_hover(""))
         self.bind_all("<space>", self._toggle_play_event)
         self.bind_all("<Right>", lambda _e: self._step(1))
         self.bind_all("<Left>", lambda _e: self._step(-1))
 
+        self.worker = TraceWorker(spec, paths)
+        threading.Thread(target=self._load_previews, daemon=True).start()
+        self._log_line("studio", "loaded {} photo(s) from gloves/".format(len(paths)))
+        self._log_line("studio", "detector {}".format(spec.module))
+        if self.summary:
+            self._log_line("studio", "{} photo(s) kept from the last visit".format(len(self.summary)))
+        if self.complete:
+            self._review(self.live)
+        else:
+            self.worker.ensure(self.live, self.traces)
+            self.worker.ensure(self.live + 1, self.traces)
+        self.app.animator.add(self._tick)
+        self._poll = self.after(60, self._drain)
+
     def close(self) -> None:
+        self._closed = True
+        self.app.store[self.spec.slug] = {"traces": self.traces, "summary": self.summary}
         self.app.animator.remove(self._tick)
         try:
             self.after_cancel(self._poll)
@@ -519,10 +271,66 @@ class RunScreen(tk.Frame):
         self.worker.stop()
         self.destroy()
 
+    def _load_previews(self) -> None:
+        """Batch thumbnails are decoded off the UI thread."""
+        for index, path in enumerate(self.paths):
+            if self._closed:
+                return
+            image = pipeline.imread_preview(path)
+            if image is not None:
+                self._previews[index] = pipeline.fit(image, 220)
+                self._film_dirty = True
+
+    # -- geometry
+
+    def _geo(self) -> dict:
+        c = self.canvas
+        W, H = max(c.winfo_width(), 10), max(c.winfo_height(), 10)
+        if self._geo_cache is not None and self._geo_cache[0] == (W, H):
+            return self._geo_cache[1]
+        g: Dict[str, object] = {"W": W, "H": H}
+        bar_top, bar_bottom = px(6), px(6) + px(64)
+        film_top = H - px(self.FILM_H)
+        rail_left = W - px(self.RAIL_W)
+        g["bar"] = (0, bar_top, W, bar_bottom)
+        g["film"] = (0, film_top, W, H)
+        g["rail"] = (rail_left, bar_bottom, W, film_top)
+        mx0, my0, mx1, my1 = px(18), bar_bottom + px(14), rail_left - px(18), film_top - px(16)
+        g["tools"] = (mx0, my0, mx1, my0 + px(24))
+        strip_top = my1 - px(118)
+        cy0, cy1 = my0 + px(24) + px(12), strip_top - px(12)
+        ref_w = int((mx1 - mx0 - px(12)) * 0.34)
+        g["ref"] = (mx0, cy0, mx0 + ref_w, cy1)
+        g["main"] = (mx0 + ref_w + px(12), cy0, mx1, cy1)
+        thumbs_w = 5 * px(62) + 4 * px(8)
+        g["stages"] = (mx1 - thumbs_w, strip_top, mx1, my1)
+        g["pipe"] = (mx0, strip_top, mx1 - thumbs_w - px(12), my1)
+        y = bar_bottom
+        for name, height in (("stamp", 162), ("figure", 92), ("mtx", 112), ("truth", 42)):
+            g[name] = (rail_left, y, W, y + px(height))
+            y += px(height)
+        g["rfoot"] = (rail_left, film_top - px(56), W, film_top)
+        g["log"] = (rail_left, y, W, film_top - px(56))
+        self._geo_cache = ((W, H), g)
+        return g
+
+    @staticmethod
+    def _inner(box) -> Tuple[int, int, int, int]:
+        x0, y0, x1, y1 = box
+        return x0 + px(16), y0 + px(32), x1 - px(16), y1 - px(24)
+
+    def _remember(self, key: tuple, make) -> ImageTk.PhotoImage:
+        photo = self._cache.get(key)
+        if photo is None:
+            if len(self._cache) > 480:
+                self._cache.clear()
+            photo = make()
+            self._cache[key] = photo
+        return photo
+
     # -- data flow
 
     def _drain(self) -> None:
-        changed = False
         while True:
             try:
                 index, trace = self.worker.results.get_nowait()
@@ -530,19 +338,9 @@ class RunScreen(tk.Frame):
                 break
             self.worker.forget(index)
             self.traces[index] = trace
-            if trace.annotated is not None:
-                preview = trace.annotated
-            elif trace.stages:
-                preview = pipeline.fit(trace.stages[0].frame(), 220)
-            else:
-                preview = np.zeros((8, 8, 3), np.uint8)
-            self._thumb_cache[index] = preview
-            self._thumbs.pop(index, None)
-            changed = True
+            self._film_dirty = True
             if index == self.live and not self.reviewing and self.stage_i < 0:
                 self._begin_trace()
-        if changed:
-            self._film_dirty = True
         self._poll = self.after(60, self._drain)
 
     def _begin_trace(self) -> None:
@@ -553,11 +351,12 @@ class RunScreen(tk.Frame):
         self.index = self.live
         self.stage_i = 0
         self._dwell_left = STAGE_DWELL_MS / 1000.0
-        self._log_line("photo", trace.name, accent=True)
+        self._log_line("photo", trace.name, colour=MARK)
         self.worker.ensure(self.live + 1, self.traces)
+        self._paint_ref()
         self._show_stage(trace.stages[0])
-        self._paint_timeline()
-        self._paint_bottom()
+        self._paint_bar()
+        self._paint_rail()
 
     def _advance(self) -> None:
         trace = self.traces.get(self.live)
@@ -565,13 +364,12 @@ class RunScreen(tk.Frame):
             return
         if self.stage_i + 1 < len(trace.stages):
             self.stage_i += 1
-            self._show_stage(trace.stages[self.stage_i])
             last = self.stage_i == len(trace.stages) - 1
             self._dwell_left = (VERDICT_DWELL_MS if last else STAGE_DWELL_MS) / 1000.0
             if last:
                 self._finish_trace(trace)
-            self._paint_timeline()
-            self._paint_bottom()
+            self._show_stage(trace.stages[self.stage_i])
+            self._paint_rail()
         else:
             self._next_photo()
 
@@ -580,23 +378,21 @@ class RunScreen(tk.Frame):
                                    "expected": trace.expected, "correct": trace.correct,
                                    "score": trace.score, "elapsed": trace.elapsed}
         self._log_line("verdict", "{}   {}".format(trace.verdict, trace.details),
-                       colour=neon.RED if trace.found else neon.GREEN)
+                       colour=REJECT if trace.found else PASS)
         self._film_dirty = True
+        self._paint_bar()
 
     def _next_photo(self) -> None:
         if self.live + 1 >= len(self.paths):
             self.complete = True
             self.playing = False
             self._log_line("studio", "run complete, {} photo(s) inspected".format(len(self.paths)))
-            self._paint_top()
-            self._paint_bottom()
-            self._film_dirty = True
+            self._paint_all()
             return
         self.live += 1
         self.index = self.live
         self.stage_i = -1
         self._reveal = 1.0
-        self._film_follow = True
         self.worker.ensure(self.live, self.traces)
         self.worker.ensure(self.live + 1, self.traces)
         trace = self.traces.get(self.live)
@@ -616,7 +412,6 @@ class RunScreen(tk.Frame):
         self.reviewing = True
         self.index = index
         self.stage_i = len(trace.stages) - 1
-        self._film_follow = True
         self._show_stage(trace.stages[self.stage_i])
         self._paint_all()
 
@@ -627,7 +422,6 @@ class RunScreen(tk.Frame):
         self.reviewing = False
         self.playing = True
         self.index = self.live
-        self._film_follow = True
         trace = self.traces.get(self.live)
         self.stage_i = self._live_stage
         if trace is not None and trace.stages and 0 <= self.stage_i < len(trace.stages):
@@ -654,25 +448,27 @@ class RunScreen(tk.Frame):
         else:
             self._review(target)
 
-    def _paint_all(self) -> None:
-        self._paint_top()
-        self._paint_timeline()
-        self._paint_bottom()
-        self._film_dirty = True
-
-    # -- viewport
-
-    def _viewport_box(self):
-        width = max(self.viewport.winfo_width(), 10)
-        height = max(self.viewport.winfo_height(), 10)
-        return width, height
-
-    def _on_viewport_resize(self) -> None:
+    def _jump(self, target: int) -> None:
+        """Open one step of the photo on screen. Scrubbing the live photo holds it
+        there until play is pressed, and it can never run ahead of the detector."""
         trace = self.traces.get(self.index)
-        if trace is not None and trace.stages and 0 <= self.stage_i < len(trace.stages):
-            self._show_stage(trace.stages[self.stage_i], animate=False)
-        else:
-            self._show_waiting()
+        if trace is None or not trace.stages or self.stage_i < 0:
+            return
+        target = max(0, min(target, len(trace.stages) - 1))
+        if not self.reviewing and self.index not in self.summary:
+            target = min(target, self.stage_i)
+            self.playing = False
+        self.stage_i = target
+        self._show_stage(trace.stages[target])
+        self._paint_bar()
+        self._paint_rail()
+
+    def _row_state(self, index: int) -> str:
+        if index in self.summary:
+            return "done"
+        if index == self.live and not self.complete:
+            return "live"
+        return "queued"
 
     def _source_image(self, index: int) -> Optional[np.ndarray]:
         cached = self._source_cache.get(index)
@@ -686,499 +482,612 @@ class RunScreen(tk.Frame):
                     self._source_cache.pop(stale, None)
         return cached
 
-    def _show_waiting(self) -> None:
-        width, height = self._viewport_box()
-        pad, top, gap, pane_w, pane_h = self._pane_geometry()
-        canvas = Image.new("RGB", (width, height), neon.PANEL_SOFT)
-        source = self._source_image(self.index)
-        if source is not None:
-            canvas.paste(neon.letterbox(source, pane_w, pane_h, neon.PANEL_SOFT), (pad, top))
-        self._current_pil = canvas
-        self._reveal = 1.0
-        self._set_labels("QUEUED", "Analysing " + self.paths[self.index].name,
-                         "the detector is working on this photo, the frames appear here as "
-                         "they are produced", "")
-        self._paint_viewport()
+    # -- painting
 
-    def _pane_geometry(self):
-        """Source on the left, current stage on the right, both letterboxed."""
-        width, height = self._viewport_box()
-        pad = neon.px(16)
-        top = neon.px(50)
-        caption = neon.px(80)
-        gap = neon.px(14)
-        pane_w = max((width - 2 * pad - gap) // 2, 40)
-        pane_h = max(height - top - caption, 40)
-        return pad, top, gap, pane_w, pane_h
-
-    def _show_stage(self, stage: Stage, animate: bool = True) -> None:
-        width, height = self._viewport_box()
-        pad, top, gap, pane_w, pane_h = self._pane_geometry()
+    def _on_resize(self) -> None:
+        self._geo_cache = None
+        self._paint_chrome()
         trace = self.traces.get(self.index)
-        frame = stage.frame()
-        source = trace.stages[0].frame() if trace is not None and trace.stages else frame
-
-        target = Image.new("RGB", (width, height), neon.PANEL_SOFT)
-        target.paste(neon.letterbox(source, pane_w, pane_h, neon.PANEL_SOFT), (pad, top))
-        target.paste(neon.letterbox(frame, pane_w, pane_h, neon.PANEL_SOFT),
-                     (pad + pane_w + gap, top))
-        if self._reveal < 1.0 and self._reveal_to is not None:
-            # a faster speed can outrun the sweep, so land the previous one first
-            self._current_pil = self._reveal_to
-            self._reveal_to = None
-            self._reveal = 1.0
-        if animate and self._current_pil is not None and self._current_pil.size == target.size:
-            self._reveal_from = self._current_pil
-            self._reveal_to = target
-            self._reveal = 0.22
+        if trace is not None and trace.stages and 0 <= self.stage_i < len(trace.stages):
+            self._show_stage(trace.stages[self.stage_i], animate=False)
         else:
-            self._reveal = 1.0
-            self._current_pil = target
-        total = len(trace.stages) if trace is not None and trace.stages else 0
-        counter = "STAGE {:02d} / {:02d}".format(self.stage_i + 1, total) if total else ""
-        if counter and self.reviewing:
-            counter = "REVIEW   " + counter
-        self._set_labels(pipeline.PHASE_LABELS.get(stage.phase, stage.phase), stage.title,
-                         stage.caption, counter)
-        self._paint_viewport()
-
-    def _set_labels(self, phase: str, title: str, caption: str, counter: str) -> None:
-        """The caption follows the sweep, so it never describes a frame that is
-        still mostly the previous one."""
-        self._labels_prev = self._labels
-        self._labels = (phase, title, caption, counter)
-
-    def _paint_viewport(self) -> None:
-        canvas = self.viewport
-        canvas.delete("all")
-        width, height = self._viewport_box()
-        phase, title, caption, counter = (
-            self._labels_prev if self._reveal < 0.45 and self._labels_prev else self._labels)
-        source = self._current_pil
-        if self._reveal < 1.0 and self._reveal_to is not None and self._reveal_from is not None:
-            source = self._reveal_from.copy()
-            cut = int(self._reveal_to.height * neon.ease_out(self._reveal))
-            if cut > 0:
-                source.paste(self._reveal_to.crop((0, 0, self._reveal_to.width, cut)), (0, 0))
-                draw = ImageDraw.Draw(source)
-                draw.line([(0, cut - 1), (source.width, cut - 1)], fill=self.accent, width=2)
-        if source is None:
-            return
-        self._frame_photo = ImageTk.PhotoImage(source)
-        canvas.create_image(0, 0, image=self._frame_photo, anchor="nw")
-
-        # corner brackets in the accent while live, plain grey while reading
-        bracket = self.accent if not self.reviewing else neon.INK_FAINT
-        arm = neon.px(26)
-        for x, y, dx, dy in ((2, 2, 1, 1), (width - 3, 2, -1, 1),
-                             (2, height - 3, 1, -1), (width - 3, height - 3, -1, -1)):
-            canvas.create_line(x, y, x + dx * arm, y, fill=bracket, width=2)
-            canvas.create_line(x, y, x, y + dy * arm, fill=bracket, width=2)
-
-        pad, top, gap, pane_w, pane_h = self._pane_geometry()
-        right_x = pad + pane_w + gap
-        label_y = top - neon.px(16)
-        canvas.create_text(pad, label_y, text="SOURCE", anchor="w",
-                           font=neon.font(9, "mono"), fill=neon.INK_FAINT)
-        canvas.create_text(pad + pane_w, label_y, text=self.paths[self.index].name, anchor="e",
-                           font=neon.font(9, "mono"), fill=neon.INK_FAINT)
-
-        badge_w = tkfont.Font(font=neon.font(9, "mono")).measure(phase) + neon.px(18)
-        canvas.create_rectangle(right_x, label_y - neon.px(9), right_x + badge_w,
-                                label_y + neon.px(9),
-                                fill=neon.mix(neon.PANEL_SOFT, self.accent, 0.20),
-                                outline=self.accent)
-        canvas.create_text(right_x + neon.px(9), label_y, text=phase, anchor="w",
-                           font=neon.font(9, "mono"), fill=self.accent)
-
-        if counter:
-            canvas.create_text(right_x + pane_w, label_y, text=counter,
-                               anchor="e", font=neon.font(9, "mono"), fill=neon.INK_SOFT)
-        else:
-            cx, cy = right_x + pane_w // 2, top + pane_h // 2
-            for slot in range(3):
-                beat = 0.5 + 0.5 * math.sin(self._pulse * 4.0 - slot * 0.8)
-                radius = neon.px(4) + neon.px(3) * beat
-                offset = (slot - 1) * neon.px(22)
-                canvas.create_oval(cx + offset - radius, cy - radius,
-                                   cx + offset + radius, cy + radius,
-                                   fill=neon.mix(neon.PANEL_SOFT, self.accent, 0.25 + 0.6 * beat),
-                                   outline="")
-
-        base = top + pane_h + neon.px(26)
-        canvas.create_text(pad, base, text=title, anchor="w",
-                           font=neon.font(15, "wide"), fill=neon.INK)
-        canvas.create_text(pad, base + neon.px(22), text=caption, anchor="nw",
-                           width=max(width - 2 * pad, 60), font=neon.font(9),
-                           fill=neon.INK_SOFT)
-
-    # -- top bar
-
-    def _paint_top(self) -> None:
-        canvas = self.top
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 10)
-        height = neon.px(self.TOP_H)
-        left = neon.px(18)
-
-        canvas.create_text(left, height // 2 - neon.px(4), text="◂  BACK", anchor="w",
-                           font=neon.font(10, "wide"), fill=neon.INK_SOFT, tags="back")
-        canvas.create_text(left, height // 2 + neon.px(14), text="Esc", anchor="w",
-                           font=neon.font(8, "mono"), fill=neon.INK_FAINT)
-
-        x = left + neon.px(110)
-        canvas.create_oval(x, height // 2 - neon.px(15), x + neon.px(9), height // 2 - neon.px(6),
-                           fill=self.accent, outline="")
-        canvas.create_text(x + neon.px(20), height // 2 - neon.px(11), text=self.spec.title,
-                           anchor="w", font=neon.font(15, "wide"), fill=neon.INK)
-        canvas.create_text(x + neon.px(20), height // 2 + neon.px(12),
-                           text="detectors/{}.py".format(self.spec.module), anchor="w",
-                           font=neon.font(8, "mono"), fill=neon.INK_FAINT)
-
-        done = len(self.summary)
-        matched = sum(1 for entry in self.summary.values() if entry["correct"])
-        right = width - neon.px(18)
-        canvas.create_text(right, height // 2 - neon.px(11),
-                           text="PHOTO {:02d} / {:02d}".format(self.index + 1, len(self.paths)),
-                           anchor="e", font=neon.font(11, "wide"), fill=neon.INK)
-        canvas.create_text(right, height // 2 + neon.px(11),
-                           text="{}  ·  filename agrees on {} of {}".format(
-                               self._clock(), matched, done) if done else self._clock(),
-                           anchor="e", font=neon.font(8, "mono"), fill=neon.INK_FAINT)
-
-        bar_x0 = x + neon.px(20)
-        bar_x1 = right - neon.px(180)
-        if bar_x1 > bar_x0 + neon.px(40):
-            y = height - neon.px(9)
-            canvas.create_line(bar_x0, y, bar_x1, y, fill=neon.LINE, width=3)
-            span = (bar_x1 - bar_x0) * self._bar_value
-            if span > 1:
-                canvas.create_line(bar_x0, y, bar_x0 + span, y, fill=self.accent, width=3)
-                canvas.create_oval(bar_x0 + span - 3, y - 3, bar_x0 + span + 3, y + 3,
-                                   fill=self.accent, outline="")
-        canvas.create_line(0, height - 1, width, height - 1, fill=neon.LINE)
-
-    def _clock(self) -> str:
-        return "{:02d}:{:02d}".format(int(self._elapsed) // 60, int(self._elapsed) % 60)
-
-    def _on_top_click(self, event) -> None:
-        if event.x < neon.px(100) and abs(event.y - neon.px(self.TOP_H) // 2) < neon.px(24):
-            self.app.show_home()
-
-    def _on_top_motion(self, event) -> None:
-        over = event.x < neon.px(100) and abs(event.y - neon.px(self.TOP_H) // 2) < neon.px(24)
-        self.top.configure(cursor="hand2" if over else "")
-        self.top.itemconfigure("back", fill=neon.INK if over else neon.INK_SOFT)
-
-    # -- timeline
-
-    def _paint_timeline(self) -> None:
-        canvas = self.timeline
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 10)
-        trace = self.traces.get(self.index)
-        canvas.create_text(0, neon.px(10), text="PIPELINE", anchor="nw",
-                           font=neon.font(9, "mono"), fill=neon.INK_FAINT)
-        if trace is None or not trace.stages or self.stage_i < 0:
-            canvas.create_text(0, neon.px(40), text="waiting for the first frames of this photo",
-                               anchor="nw", font=neon.font(9), fill=neon.INK_FAINT)
-            return
-
-        stages = trace.stages
-        finished = self.index in self.summary
-        top = neon.px(34)
-        gap = neon.px(4)
-        chip_w = max((width - gap * (len(stages) - 1)) / len(stages), neon.px(8))
-        phase_runs = []
-        for index, stage in enumerate(stages):
-            x = index * (chip_w + gap)
-            active = index == self.stage_i
-            if active:
-                colour = self.accent
-            elif finished or index < self.stage_i:
-                colour = neon.mix(neon.LINE_HI, self.accent, 0.55)
-            else:
-                colour = neon.LINE
-            canvas.create_rectangle(x, top, x + chip_w, top + neon.px(9),
-                                    fill=colour, outline="", tags=("chip", "chip{}".format(index)))
-            if active:
-                canvas.create_rectangle(x, top - neon.px(4), x + chip_w, top + neon.px(13),
-                                        outline=self.accent, width=1)
-            if not phase_runs or phase_runs[-1][0] != stage.phase:
-                phase_runs.append([stage.phase, x, x + chip_w, index])
-            else:
-                phase_runs[-1][2] = x + chip_w
-
-        label_y = top + neon.px(24)
-        for phase, x0, _x1, first in phase_runs:
-            reached = finished or self.stage_i >= first
-            canvas.create_line(x0, label_y - neon.px(6), x0, label_y + neon.px(18),
-                               fill=neon.LINE_HI)
-            canvas.create_text(x0 + neon.px(7), label_y + neon.px(2),
-                               text=pipeline.PHASE_LABELS.get(phase, phase), anchor="w",
-                               font=neon.font(8, "mono"),
-                               fill=self.accent if reached else neon.INK_FAINT)
-        if 0 <= self.stage_i < len(stages):
-            canvas.create_text(width, neon.px(10),
-                               text=stages[self.stage_i].key, anchor="ne",
-                               font=neon.font(8, "mono"), fill=neon.INK_FAINT)
-
-    def _on_timeline_click(self, event) -> None:
-        trace = self.traces.get(self.index)
-        if trace is None or not trace.stages or self.stage_i < 0:
-            return
-        width = max(self.timeline.winfo_width(), 10)
-        index = int(event.x / max(width, 1) * len(trace.stages))
-        index = max(0, min(index, len(trace.stages) - 1))
-        if not self.reviewing and self.index not in self.summary:
-            # scrubbing the live photo holds it there until play is pressed
-            index = min(index, self.stage_i)
-            self.playing = False
-        self.stage_i = index
-        self._show_stage(trace.stages[index])
-        self._paint_timeline()
-        self._paint_bottom()
-
-    # -- folder list
-
-    def _film_metrics(self):
-        return neon.px(56), neon.px(68)
-
-    def _row_at(self, y: int) -> int:
-        _side, row_h = self._film_metrics()
-        index = int((y - neon.px(26) + self._film_offset) // row_h)
-        return index if 0 <= index < len(self.paths) else -1
-
-    def _row_state(self, index: int) -> str:
-        if index in self.summary:
-            return "done"
-        if index == self.live and not self.complete:
-            return "live"
-        return "queued"
-
-    def _tile(self, index: int, path: Path, side: int, current: bool, lit: bool):
-        """Folder thumbnails are rebuilt only when their state changes."""
-        state = (side, current, lit, index in self.traces)
-        cached = self._thumbs.get(index)
-        if cached is not None and cached[0] == state:
-            return cached[1]
-        image = self._thumb_cache.get(index)
-        if image is None:
-            raw = pipeline.imread_preview(path)
-            image = pipeline.fit(raw, 220) if raw is not None else np.zeros((8, 8, 3), np.uint8)
-            self._thumb_cache[index] = image
-        tile = neon.thumb(image, side, 8,
-                          ring_colour=self.accent if current else None,
-                          dim=1.0 if lit else 0.45)
-        self._thumbs[index] = (state, tile)
-        return tile
-
-    def _paint_film(self) -> None:
-        canvas = self.film
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 10)
-        height = max(canvas.winfo_height(), 10)
-        side, row_h = self._film_metrics()
-        top = neon.px(26)
-        visible = height - top
-        needed = row_h * len(self.paths)
-
-        for index, path in enumerate(self.paths):
-            y = top + index * row_h - self._film_offset
-            if y < top - row_h or y > height:
-                continue
-            current = index == self.index
-            state = self._row_state(index)
-            tile = self._tile(index, path, side, current, state != "queued")
-            canvas.create_image(0, y, image=tile, anchor="nw")
-
-            text_x = side + neon.px(12)
-            canvas.create_text(text_x, y + neon.px(14), text=path.name, anchor="w",
-                               font=neon.font(9, "strong" if current else "regular"),
-                               fill=neon.INK if state != "queued" else neon.INK_FAINT)
-            if state == "done":
-                entry = self.summary[index]
-                colour = neon.RED if entry["found"] else neon.GREEN
-                canvas.create_oval(text_x, y + neon.px(30), text_x + neon.px(8), y + neon.px(38),
-                                   fill=colour, outline="")
-                label = "{}   {}".format(entry["verdict"],
-                                         "as named" if entry["correct"] else "differs from the name")
-                canvas.create_text(text_x + neon.px(15), y + neon.px(34), text=label, anchor="w",
-                                   font=neon.font(8, "mono"), fill=colour)
-            elif state == "live":
-                paused = self.reviewing or not self.playing
-                canvas.create_text(text_x, y + neon.px(34),
-                                   text="paused, click to resume" if paused else "processing",
-                                   anchor="w", font=neon.font(8, "mono"), fill=self.accent)
-            else:
-                canvas.create_text(text_x, y + neon.px(34), text="queued", anchor="w",
-                                   font=neon.font(8, "mono"), fill=neon.INK_FAINT)
-
-        if needed > visible:
-            track_h = visible * visible / needed
-            track_y = top + (self._film_offset / max(needed - visible, 1)) * (visible - track_h)
-            canvas.create_rectangle(width - 3, track_y, width - 1, track_y + track_h,
-                                    fill=neon.LINE_HI, outline="")
-
-        # drawn last so a scrolled row never runs underneath the heading
-        canvas.create_rectangle(0, 0, width, top - neon.px(4), fill=neon.BASE, outline="")
-        canvas.create_text(0, neon.px(4), text="FOLDER", anchor="nw",
-                           font=neon.font(9, "mono"), fill=neon.INK_FAINT)
-        canvas.create_text(width, neon.px(4),
-                           text="{} of {} done".format(len(self.summary), len(self.paths)),
-                           anchor="ne", font=neon.font(9, "mono"), fill=neon.INK_FAINT)
-
-    def _on_film_click(self, event) -> None:
-        index = self._row_at(event.y)
-        state = self._row_state(index) if index >= 0 else ""
-        if state == "done":
-            self._review(index)
-        elif state == "live":
-            self._go_live()
-
-    def _on_film_motion(self, event) -> None:
-        index = self._row_at(event.y)
-        clickable = index >= 0 and self._row_state(index) != "queued"
-        self.film.configure(cursor="hand2" if clickable else "")
-
-    def _on_film_wheel(self, event) -> None:
-        _side, row_h = self._film_metrics()
-        height = max(self.film.winfo_height(), 10) - neon.px(26)
-        needed = row_h * len(self.paths)
-        self._film_follow = False
-        self._film_offset = max(0.0, min(self._film_offset - event.delta / 3.0,
-                                         max(needed - height, 0.0)))
-        self._paint_film()
-
-    # -- telemetry
-
-    def _log_line(self, tag: str, text: str, colour: Optional[str] = None,
-                  accent: bool = False) -> None:
-        self._log.append({"tag": tag, "text": text, "age": 0.0,
-                          "colour": colour or (self.accent if accent else neon.INK_SOFT)})
-        del self._log[:-160]
+            self._show_waiting()
+        self._paint_ref()
+        self._paint_all()
         self._paint_log()
 
-    def _paint_log(self) -> None:
-        canvas = self.telemetry
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 10)
-        height = max(canvas.winfo_height(), 10)
-        canvas.create_text(0, neon.px(4), text="TELEMETRY", anchor="nw",
-                           font=neon.font(9, "mono"), fill=neon.INK_FAINT)
-        line_h = neon.px(15)
-        top = neon.px(26)
-        text_x = neon.px(52)
-        rows = max(int((height - top) / line_h), 1)
-        measure = tkfont.Font(font=neon.font(8, "mono"))
-        room = max(width - text_x, 40)
-        y = height - line_h
-        for entry in reversed(self._log[-rows:]):
-            fresh = min(entry["age"] / 0.35, 1.0)
-            colour = neon.mix(neon.BASE, entry["colour"], 0.35 + 0.65 * fresh)
-            canvas.create_text(0, y, text="{:>7}".format(entry["tag"]), anchor="w",
-                               font=neon.font(8, "mono"), fill=neon.INK_FAINT)
-            canvas.create_text(text_x, y, text=_clip(entry["text"], measure, room), anchor="w",
-                               font=neon.font(8, "mono"), fill=colour)
-            y -= line_h
-            if y < top:
-                break
+    def _paint_all(self) -> None:
+        self._paint_bar()
+        self._paint_ref()
+        self._paint_steps()
+        self._paint_rail()
+        self._film_dirty = True
 
-    # -- bottom bar
+    def _paint_chrome(self) -> None:
+        c = self.canvas
+        c.delete("chrome")
+        g = self._geo()
+        W = g["W"]
+        self._images["hazard"] = stripes(W, px(6), MARK, INK, px(13))
+        c.create_image(0, 0, image=self._images["hazard"], anchor="nw", tags="chrome")
+        x0, y0, x1, y1 = g["rail"]
+        c.create_rectangle(x0, y0, x1, y1, fill=INK_2, outline="", tags="chrome")
+        c.create_line(x0, y0, x0, y1, fill=RULE, tags="chrome")
+        c.create_line(0, g["bar"][3] - 1, W, g["bar"][3] - 1, fill=RULE, tags="chrome")
+        c.create_line(0, g["film"][1], W, g["film"][1], fill=RULE, tags="chrome")
+        for name in ("figure", "mtx", "truth"):
+            y = g[name][3] - 1
+            c.create_line(x0, y, x1, y, fill=RULE, tags="chrome")
+        c.create_line(x0, g["rfoot"][1], x1, g["rfoot"][1], fill=RULE, tags="chrome")
+        c.tag_lower("chrome")
 
-    def _play_label(self) -> str:
+    # -- bar
+
+    def _paint_bar(self) -> None:
+        c = self.canvas
+        c.delete("bar")
+        g = self._geo()
+        _x0, y0, x1, y1 = g["bar"]
+        mid = (y0 + y1) // 2
+        n = len(self.paths)
+
+        colour = PAPER if self._hover == "back" else DIM
+        bx = px(24)
+        c.create_line(bx + px(9), mid - px(5), bx + px(4), mid, bx + px(9), mid + px(5), fill=colour,
+                      width=max(px(1.8), 1), capstyle="round", joinstyle="round", tags="bar")
+        back = c.create_text(bx + px(20), mid, text="Detectors", anchor="w", font=font("sans", 13),
+                             fill=colour, tags="bar")
+        back_right = c.bbox(back)[2]
+        self._hits["back"] = [(px(14), y0, back_right + px(10), y1, "back")]
+        tick = back_right + px(24)
+        c.create_rectangle(tick, mid - px(13), tick + px(3), mid + px(13), fill=MARK, outline="", tags="bar")
+        c.create_text(tick + px(17), mid, text=self.name, anchor="w", font=font("disp", 22), fill=PAPER,
+                      tags="bar")
+
+        x = x1 - px(18)
+        total = c.create_text(x, mid, text=" / {:02d}".format(n), anchor="e", font=font("mono", 12.5),
+                              fill=DIM, tags="bar")
+        count = c.create_text(c.bbox(total)[0], mid, text="{:02d}".format(self.index + 1), anchor="e",
+                              font=font("mono", 12.5, True), fill=PAPER, tags="bar")
+        x = c.bbox(count)[0] - px(26)
         if self.complete:
-            return "■"
-        if self.reviewing or not self.playing:
-            return "▸"
-        return "❚❚"
+            status, colour = "COMPLETE {} / {}".format(n, n), PASS
+        elif self.playing and not self.reviewing:
+            status, colour = "RUNNING {} / {}".format(self.live + 1, n), MARK
+        else:
+            status, colour = "PAUSED {} / {}".format(self.live + 1, n), DIM
+        label = c.create_text(x, mid, text=status, anchor="e", font=font("mono", 11.5), fill=colour,
+                              tags="bar")
+        right = c.bbox(label)[0] - px(11)
+        left = right - px(130)
+        c.create_rectangle(left, mid - px(2), right, mid + px(2), fill=RULE, outline="", tags="bar")
+        c.create_rectangle(left, mid - px(2), left + (right - left) * self._bar_value, mid + px(2),
+                           fill=PASS if self.complete else MARK, outline="", tags=("bar", "progfill"))
+        self._prog = (left, right, mid)
 
-    def _buttons(self):
-        width = max(self.bottom.winfo_width(), 10)
-        height = neon.px(self.BOTTOM_H)
-        y = height // 2
-        w, h = neon.px(46), neon.px(34)
-        gap = neon.px(8)
-        specs = [("prev", "◂◂"), ("play", self._play_label()), ("next", "▸▸"),
-                 ("save", "SAVE")]
-        widths = [w, w, w, neon.px(70)]
-        total = sum(widths) + gap * (len(specs) - 1)
-        x = width - neon.px(18) - total
-        boxes = []
-        for (key, label), bw in zip(specs, widths):
-            boxes.append((key, label, x, y - h // 2, bw, h))
-            x += bw + gap
-        return boxes
+    # -- tools row
 
-    def _paint_bottom(self, hover: str = "") -> None:
-        canvas = self.bottom
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 10)
-        height = neon.px(self.BOTTOM_H)
-        canvas.create_line(0, 0, width, 0, fill=neon.LINE)
+    def _paint_tools(self) -> None:
+        c = self.canvas
+        c.delete("tools")
+        g = self._geo()
+        x0, y0, x1, y1 = g["tools"]
+        mid = (y0 + y1) // 2
+        trace = self.traces.get(self.index)
+        if trace is not None and trace.stages and 0 <= self.stage_i < len(trace.stages):
+            stage = trace.stages[self.stage_i]
+            items = [("STEP", DIM_2, 10.5, False),
+                     ("{:02d} / {:02d}".format(self.stage_i + 1, len(trace.stages)), PAPER, 11, True),
+                     (PHASE_NAMES.get(stage.phase, stage.phase.title()).upper(), MARK, 10.5, True)]
+            if self.reviewing:
+                items.append(("REVIEWING A FINISHED PHOTO", DIM, 10.5, False))
+        else:
+            items = [("WAITING FOR THE DETECTOR", DIM_2, 10.5, False)]
+        x = x0
+        for text, colour, size, bold in items:
+            item = c.create_text(x, mid, text=text, anchor="w", font=font("mono", size, bold), fill=colour,
+                                 tags="tools")
+            x = c.bbox(item)[2] + px(12)
 
-        # the verdict of a live photo only shows once its last frame is up
+        keys = [("←", True), ("→", True), ("photo", False), ("Space", True), ("play", False)]
+        x = x1
+        for text, boxed in reversed(keys):
+            if boxed:
+                item = c.create_text(x - px(5), mid, text=text, anchor="e", font=font("mono", 10.5),
+                                     fill=DIM, tags="tools")
+                bx0, by0, bx1, by1 = c.bbox(item)
+                c.create_rectangle(bx0 - px(5), by0, bx1 + px(5), by1, outline=RULE, tags="tools")
+                x = bx0 - px(10)
+            else:
+                item = c.create_text(x - px(4), mid, text=text, anchor="e", font=font("mono", 10.5),
+                                     fill=DIM_2, tags="tools")
+                x = c.bbox(item)[0] - px(14)
+
+    # -- the two panes
+
+    def _tab(self, tag: str, x: int, y: int, text: str, fill: str, ink: str, bold: bool, room: int) -> None:
+        c = self.canvas
+        fnt = font("mono", 11, bold)
+        text = clip(text, fnt, max(room - px(22), 20))
+        item = c.create_text(x + px(11), y + px(11), text=text, anchor="w", font=fnt, fill=ink, tags=tag)
+        right = c.bbox(item)[2] + px(11)
+        back = c.create_rectangle(x, y, right, y + px(22), fill=fill, outline="", tags=tag)
+        c.tag_lower(back, item)
+
+    def _source_frame(self, index: int) -> Optional[np.ndarray]:
+        trace = self.traces.get(index)
+        if trace is not None and trace.stages:
+            return trace.stages[0].frame()
+        return self._source_image(index)
+
+    def _paint_ref(self) -> None:
+        c = self.canvas
+        c.delete("ref")
+        g = self._geo()
+        x0, y0, x1, y1 = g["ref"]
+        c.create_rectangle(x0, y0, x1, y1, fill=PANE, outline=RULE, tags="ref")
+        ix0, iy0, ix1, iy1 = self._inner(g["ref"])
+        source = self._source_frame(self.index)
+        if source is not None and ix1 - ix0 > 8 and iy1 - iy0 > 8:
+            has_trace = self.index in self.traces
+            photo = self._remember(("ref", self.index, has_trace, ix1 - ix0, iy1 - iy0),
+                                   lambda: ImageTk.PhotoImage(Image.fromarray(
+                                       letterbox(source, ix1 - ix0, iy1 - iy0))))
+            self._images["ref"] = photo
+            c.create_image(ix0, iy0, image=photo, anchor="nw", tags="ref")
+        self._tab("ref", x0, y0, "SOURCE", RULE, PAPER, False, x1 - x0)
+        trace = self.traces.get(self.index)
+        meta = self.paths[self.index].name
+        if trace is not None and trace.size[0]:
+            meta += "  ·  {}×{}".format(*trace.size)
+        c.create_text(x0 + px(13), y1 - px(9), text=clip(meta, font("mono", 10.5), x1 - x0 - px(26)),
+                      anchor="sw", font=font("mono", 10.5), fill=DIM_2, tags="ref")
+        self._ref_index = self.index
+
+    def _show_waiting(self) -> None:
+        self._current = None
+        self._reveal = 1.0
+        self._reveal_to = None
+        self._set_labels("ANALYZING", "the detector is working on this photo, its steps appear here "
+                                      "as they are produced")
+        if self._ref_index != self.index:
+            self._paint_ref()
+        self._paint_main()
+        self._paint_steps()
+
+    def _show_stage(self, stage: Stage, animate: bool = True) -> None:
+        g = self._geo()
+        ix0, iy0, ix1, iy1 = self._inner(g["main"])
+        target = letterbox(stage.frame(), max(ix1 - ix0, 8), max(iy1 - iy0, 8))
+        if self._reveal < 1.0 and self._reveal_to is not None:
+            self._current = self._reveal_to  # land a crossfade that is still running
+            self._reveal_to = None
+            self._reveal = 1.0
+        if animate and self._current is not None and self._current.shape == target.shape:
+            self._reveal_from = self._current
+            self._reveal_to = target
+            self._reveal = 0.0
+        else:
+            self._reveal = 1.0
+            self._current = target
+        self._set_labels("{:02d} · {}".format(self.stage_i + 1, stage.title.upper()), stage.caption)
+        if self._ref_index != self.index:
+            self._paint_ref()
+        self._paint_main()
+        self._paint_steps()
+
+    def _set_labels(self, tab: str, meta: str) -> None:
+        """The labels change halfway through the crossfade, so they never describe
+        a frame that is still mostly the previous one."""
+        self._labels_prev = self._labels
+        self._labels = (tab, meta)
+
+    def _paint_main(self) -> None:
+        c = self.canvas
+        c.delete("main")
+        g = self._geo()
+        x0, y0, x1, y1 = g["main"]
+        c.create_rectangle(x0, y0, x1, y1, fill=PANE, outline=RULE, tags="main")
+        ix0, iy0, ix1, iy1 = self._inner(g["main"])
+        tab, meta = self._labels_prev if self._reveal < 0.5 and self._labels_prev else self._labels
+        frame = self._current
+        if self._reveal < 1.0 and self._reveal_to is not None and self._reveal_from is not None:
+            mix_t = neon.ease_in_out(self._reveal)
+            frame = cv2.addWeighted(self._reveal_from, 1.0 - mix_t, self._reveal_to, mix_t, 0)
+        if frame is not None:
+            self._images["main"] = ImageTk.PhotoImage(Image.fromarray(frame))
+            c.create_image(ix0, iy0, image=self._images["main"], anchor="nw", tags="main")
+        else:
+            cx, cy = (ix0 + ix1) // 2, (iy0 + iy1) // 2
+            for slot in range(3):
+                beat = 0.5 + 0.5 * np.sin(self._pulse * 4.0 - slot * 0.8)
+                half = px(4)
+                sx = cx + (slot - 1) * px(18)
+                c.create_rectangle(sx - half, cy - half, sx + half, cy + half, outline="",
+                                   fill=mix(PANE, MARK, 0.25 + 0.75 * beat), tags="main")
+        self._tab("main", x0, y0, tab, MARK, INK, True, x1 - x0)
+        c.create_text(x0 + px(13), y1 - px(9), text=clip(meta, font("mono", 10.5), x1 - x0 - px(26)),
+                      anchor="sw", font=font("mono", 10.5), fill=DIM_2, tags="main")
+
+    # -- pipeline and stage thumbnails
+
+    def _paint_steps(self) -> None:
+        self._paint_tools()
+        self._paint_pipe()
+        self._paint_stages()
+
+    def _paint_pipe(self) -> None:
+        c = self.canvas
+        c.delete("pipe")
+        g = self._geo()
+        x0, y0, x1, y1 = g["pipe"]
+        c.create_rectangle(x0, y0, x1, y1, outline=RULE, tags="pipe")
+        c.create_text(x0 + px(16), y0 + px(12), text="PIPELINE", anchor="nw", font=font("disp", 12.5),
+                      fill=PAPER, tags="pipe")
+        trace = self.traces.get(self.index)
+        order: List[str] = []
+        first: Dict[str, int] = {}
+        if trace is not None and trace.stages:
+            for i, stage in enumerate(trace.stages):
+                if stage.phase not in first:
+                    first[stage.phase] = i
+                    order.append(stage.phase)
+            c.create_text(x1 - px(16), y0 + px(14), anchor="ne", font=font("mono", 10.5), fill=DIM,
+                          text="{} STEPS  ·  {:.2f} S".format(len(trace.stages), trace.elapsed), tags="pipe")
+        if not order:
+            order = list(PHASE_NAMES)
+        current = -1
+        if trace is not None and trace.stages and 0 <= self.stage_i < len(trace.stages):
+            phase = trace.stages[self.stage_i].phase
+            current = order.index(phase) if phase in order else -1
+
+        col_w = (x1 - x0 - px(32)) / max(len(order), 1)
+        top = y1 - px(12) - px(48)
+        square = px(9)
+        hits = []
+        for k, phase in enumerate(order):
+            cx = int(x0 + px(16) + k * col_w)
+            done, now = k < current, k == current
+            if now:
+                c.create_rectangle(cx - px(4), top - px(4), cx + square + px(4), top + square + px(4),
+                                   fill=mix(INK, MARK, 0.18), outline="", tags="pipe")
+            c.create_rectangle(cx, top, cx + square, top + square, outline="", tags="pipe",
+                               fill=PASS if done else (MARK if now else RULE))
+            if k < len(order) - 1:
+                c.create_line(cx + px(12), top + px(4), int(cx + col_w - px(14)), top + px(4),
+                              fill=PASS if done else RULE, tags="pipe")
+            note = ANALYSIS_NOTES.get(self.spec.slug, "") if phase == "analysis" else PHASE_NOTES.get(phase, "")
+            c.create_text(cx, top + px(17), text=PHASE_NAMES.get(phase, phase.title()), anchor="nw",
+                          font=font("semi", 12.5), fill=PAPER, tags="pipe")
+            c.create_text(cx, top + px(35), text=clip(note, font("sans", 10.5), int(col_w - px(14))),
+                          anchor="nw", font=font("sans", 10.5), fill=DIM_2, tags="pipe")
+            if phase in first:
+                hits.append((cx - px(6), top - px(10), int(cx + col_w - px(8)), y1, first[phase]))
+        self._hits["pipe"] = hits
+
+    def _paint_stages(self) -> None:
+        """Thumbnails of the steps in the current phase, the one on screen marked."""
+        c = self.canvas
+        c.delete("stages")
+        self._hits["stages"] = []
+        g = self._geo()
+        x0, y0, _x1, _y1 = g["stages"]
+        trace = self.traces.get(self.index)
+        if trace is None or not trace.stages or not 0 <= self.stage_i < len(trace.stages):
+            return
+        stages = trace.stages
+        phase = stages[self.stage_i].phase
+        members = [i for i, stage in enumerate(stages) if stage.phase == phase]
+        at = members.index(self.stage_i)
+        start = max(0, min(at - 2, len(members) - 5))
+        tw, th, gap = px(62), px(80), px(8)
+        hits = []
+        for k, si in enumerate(members[start:start + 5]):
+            tx = x0 + k * (tw + gap)
+            on = si == self.stage_i
+            photo = self._remember(("thumb", self.index, si, tw, th),
+                                   lambda si=si: ImageTk.PhotoImage(cover(stages[si].frame(), tw - 2, th - 2)))
+            c.create_rectangle(tx, y0, tx + tw, y0 + th, fill=PANE, outline=MARK if on else RULE,
+                               tags="stages")
+            c.create_image(tx + 1, y0 + 1, image=photo, anchor="nw", tags="stages")
+            caption = clip(stages[si].key.replace("_", " ").upper(), font("mono", 9.5), tw)
+            c.create_text(tx, y0 + th + px(5), text=caption, anchor="nw", font=font("mono", 9.5),
+                          fill=MARK if on else DIM, tags="stages")
+            hits.append((tx, y0, tx + tw, y0 + th + px(20), si))
+        self._hits["stages"] = hits
+
+    # -- rail
+
+    def _paint_rail(self) -> None:
+        self._paint_stamp()
+        self._paint_figure()
+        self._paint_mtx()
+        self._paint_truth()
+        self._paint_rfoot()
+
+    def _paint_stamp(self) -> None:
+        c = self.canvas
+        c.delete("stamp")
+        g = self._geo()
+        x0, y0, x1, y1 = g["stamp"]
         entry = self.summary.get(self.index)
         trace = self.traces.get(self.index)
-        left = neon.px(18)
-        if entry:
-            found = entry["found"]
-            colour = neon.RED if found else neon.GREEN
-            label = "DEFECT" if found else "PASS"
-            glow = 0.25 + 0.20 * (0.5 + 0.5 * math.sin(self._pulse * 3.4)) if found else 0.22
-            pill_w = neon.px(112)
-            canvas.create_rectangle(left, height // 2 - neon.px(19), left + pill_w,
-                                    height // 2 + neon.px(19),
-                                    fill=neon.mix(neon.BASE, colour, glow), outline=colour)
-            canvas.create_text(left + pill_w // 2, height // 2, text=label,
-                               font=neon.font(14, "wide"), fill=colour)
-            detail_x = left + pill_w + neon.px(16)
-            canvas.create_text(detail_x, height // 2 - neon.px(11),
-                               text=(trace.details if trace is not None else ""), anchor="w",
-                               width=max(width - detail_x - neon.px(320), 80),
-                               font=neon.font(9), fill=neon.INK)
-            canvas.create_text(detail_x, height // 2 + neon.px(15),
-                               text="score {:.2f}   ·   {:.2f}s   ·   filename says {}".format(
-                                   entry["score"], entry["elapsed"],
-                                   "defect" if entry["expected"] else "clean"),
-                               anchor="w", font=neon.font(8, "mono"), fill=neon.INK_FAINT)
+        if entry and trace is not None:
+            ground, ink = (REJECT if entry["found"] else PASS), INK
+            label, head, body = "DETECTOR VERDICT", ("REJECT" if entry["found"] else "PASS"), trace.details
         else:
-            canvas.create_text(left, height // 2, text="running the pipeline…", anchor="w",
-                               font=neon.font(11), fill=neon.INK_SOFT)
+            ground, ink = RULE, PAPER
+            label = "IN PROGRESS"
+            head = "RUNNING" if self.playing and not self.reviewing else "PAUSED"
+            if trace is not None and trace.stages and 0 <= self.stage_i < len(trace.stages):
+                stage = trace.stages[self.stage_i]
+                body = "Step {} of {}, {}.".format(self.stage_i + 1, len(trace.stages),
+                                                   PHASE_NAMES.get(stage.phase, stage.phase).lower())
+            else:
+                body = "Waiting for the detector to finish this photo."
+        if len(body) > 96:
+            body = body[:95].rstrip() + "…"
+        c.create_rectangle(x0, y0, x1, y1, fill=ground, outline="", tags="stamp")
+        c.create_text(x0 + px(22), y0 + px(16), text=label, anchor="nw", font=font("mono", 10.5, True),
+                      fill=mix(ground, ink, 0.75), tags="stamp")
+        c.create_text(x0 + px(19), y0 + px(28), text=head, anchor="nw", font=font("disp", 52), fill=ink,
+                      tags="stamp")
+        c.create_text(x0 + px(22), y0 + px(104), text=body, anchor="nw", width=x1 - x0 - px(44),
+                      font=font("semi", 12.5), fill=ink, tags="stamp")
+        self._images["tape"] = stripes(x1 - x0, px(5), mix(ground, INK, 0.85), ground, px(11))
+        c.create_image(x0, y1 - px(5), image=self._images["tape"], anchor="nw", tags="stamp")
 
-        for key, label, x, y, w, h in self._buttons():
-            active = key == hover
-            disabled = key == "play" and self.complete
-            fill = neon.mix(neon.PANEL, self.accent, 0.30 if active and not disabled else 0.10)
-            canvas.create_rectangle(x, y, x + w, y + h, fill=fill,
-                                    outline=self.accent if active and not disabled else neon.LINE_HI)
-            canvas.create_text(x + w // 2, y + h // 2, text=label,
-                               font=neon.font(10, "wide" if key == "save" else "regular"),
-                               fill=neon.INK_FAINT if disabled else (
-                                   neon.INK if active else neon.INK_SOFT))
+    def _figure(self) -> Tuple[str, str, str]:
+        """The one number that matters for this detector."""
+        entry = self.summary.get(self.index)
+        trace = self.traces.get(self.index)
+        if not entry or trace is None:
+            return "–", "", "waiting for\nthe verdict"
+        if self.spec.slug == "dirty":
+            found = re.search(r"([\d.]+)% of the glove", trace.details)
+            return "{:.2f}".format(float(found.group(1)) if found else 0.0), "%", "of the glove\nsurface affected"
+        if self.spec.slug == "fold":
+            return "{:.2f}".format(entry["score"]), "", "crease score,\n1.00 at a 1.5R span"
+        if self.spec.slug == "tear":
+            return "{:.2f}".format(entry["score"]), "", "strongest tear\nconfidence"
+        return "{:.2f}".format(entry["score"]), "", "detector\nscore"
 
-    def _button_at(self, x: int, y: int) -> str:
-        for key, _label, bx, by, bw, bh in self._buttons():
-            if bx <= x <= bx + bw and by <= y <= by + bh:
-                return key
-        return ""
+    def _paint_figure(self) -> None:
+        c = self.canvas
+        c.delete("figure")
+        g = self._geo()
+        x0, _y0, _x1, y1 = g["figure"]
+        value, unit, caption = self._figure()
+        pending = value == "–"
+        big = c.create_text(x0 + px(20), y1 - px(4), text=value, anchor="sw", font=font("disp", 62),
+                            fill=DIM_2 if pending else PAPER, tags="figure")
+        right = c.bbox(big)[2]
+        if unit:
+            item = c.create_text(right + px(6), y1 - px(22), text=unit, anchor="sw", font=font("disp", 22),
+                                 fill=MARK, tags="figure")
+            right = c.bbox(item)[2]
+        c.create_text(right + px(12), y1 - px(24), text=caption, anchor="sw", font=font("sans", 11.5),
+                      fill=DIM, tags="figure")
 
-    def _on_bottom_motion(self, event) -> None:
-        key = self._button_at(event.x, event.y)
-        self.bottom.configure(cursor="hand2" if key else "")
-        self._hover_button = key
-        self._paint_bottom(key)
+    def _paint_mtx(self) -> None:
+        c = self.canvas
+        c.delete("mtx")
+        g = self._geo()
+        x0, y0, x1, _y1 = g["mtx"]
+        entry = self.summary.get(self.index)
+        trace = self.traces.get(self.index)
+        if entry and trace is not None:
+            rows = [("Regions", str(trace.regions)), ("Score", "{:.2f}".format(entry["score"])),
+                    ("Time", "{:.2f} s".format(entry["elapsed"]))]
+        else:
+            rows = [("Regions", "—"), ("Score", "—"), ("Time", "—")]
+        row_h = px(35)
+        for k, (name, value) in enumerate(rows):
+            mid = y0 + px(4) + k * row_h + row_h // 2
+            c.create_text(x0 + px(22), mid, text=name, anchor="w", font=font("sans", 12.5), fill=DIM,
+                          tags="mtx")
+            c.create_text(x1 - px(22), mid, text=value, anchor="e", font=font("mono", 13), fill=PAPER,
+                          tags="mtx")
+            if k < len(rows) - 1:
+                y = y0 + px(4) + (k + 1) * row_h
+                c.create_line(x0 + px(22), y, x1 - px(22), y, fill=mix(INK_2, RULE, 0.6), tags="mtx")
 
-    def _on_bottom_click(self, event) -> None:
-        key = self._button_at(event.x, event.y)
-        if key == "prev":
-            self._step(-1)
-        elif key == "next":
-            self._step(1)
-        elif key == "play":
-            self._toggle_play()
-        elif key == "save":
-            self._save_frame()
+    def _paint_truth(self) -> None:
+        c = self.canvas
+        c.delete("truth")
+        g = self._geo()
+        x0, y0, x1, y1 = g["truth"]
+        mid = (y0 + y1) // 2
+        expected = self.paths[self.index].stem.lower().startswith(self.spec.prefix)
+        says = c.create_text(x0 + px(22), mid, text="Filename says", anchor="w", font=font("sans", 12),
+                             fill=DIM, tags="truth")
+        c.create_text(c.bbox(says)[2] + px(6), mid, text=self.spec.prefix if expected else "clean",
+                      anchor="w", font=font("mono", 12), fill=PAPER, tags="truth")
+        entry = self.summary.get(self.index)
+        if entry:
+            text, colour = ("AGREES", PASS) if entry["correct"] else ("DIFFERS", REJECT)
+        else:
+            text, colour = "—", DIM_2
+        c.create_text(x1 - px(22), mid, text=text, anchor="e", font=font("mono", 11, True), fill=colour,
+                      tags="truth")
+
+    def _paint_rfoot(self) -> None:
+        c = self.canvas
+        c.delete("rfoot")
+        g = self._geo()
+        x0, y0, x1, y1 = g["rfoot"]
+        mid = (y0 + y1) // 2
+        bw, bh = px(36), px(34)
+        hits = []
+        for k, key in enumerate(("prev", "play", "next")):
+            bx = x0 + px(16) + k * (bw + px(8))
+            by = mid - bh // 2
+            hot = self._hover == "rfoot:" + key
+            if key == "play":
+                disabled = self.complete
+                c.create_rectangle(bx, by, bx + bw, by + bh, fill=RULE if disabled else MARK,
+                                   outline=RULE if disabled else MARK, tags="rfoot")
+                ink = DIM_2 if disabled else INK
+                cx, cy = bx + bw // 2, by + bh // 2
+                if self.playing and not self.reviewing and not self.complete:
+                    for dx in (-px(3), px(3)):
+                        c.create_rectangle(cx + dx - px(1.5), cy - px(5), cx + dx + px(1.5), cy + px(5),
+                                           fill=ink, outline="", tags="rfoot")
+                else:
+                    c.create_polygon(cx - px(3), cy - px(5.5), cx - px(3), cy + px(5.5), cx + px(5), cy,
+                                     fill=ink, outline="", tags="rfoot")
+            else:
+                c.create_rectangle(bx, by, bx + bw, by + bh, outline=DIM_2 if hot else RULE, tags="rfoot")
+                cx, cy = bx + bw // 2, by + bh // 2
+                sign = -1 if key == "prev" else 1
+                c.create_line(cx - sign * px(2), cy - px(5), cx + sign * px(3), cy, cx - sign * px(2),
+                              cy + px(5), fill=PAPER if hot else DIM, width=max(px(1.8), 1),
+                              capstyle="round", joinstyle="round", tags="rfoot")
+            hits.append((bx, by, bx + bw, by + bh, key))
+        hot = self._hover == "rfoot:save"
+        label = c.create_text(x1 - px(16) - px(15), mid, text="Save result", anchor="e",
+                              font=font("semi", 12.5), fill=PAPER, tags="rfoot")
+        lx0, _ly0, lx1, _ly1 = c.bbox(label)
+        box = (lx0 - px(15), mid - bh // 2, lx1 + px(15), mid + bh // 2)
+        c.create_rectangle(*box, outline=DIM_2 if hot else RULE, tags="rfoot")
+        hits.append(box + ("save",))
+        self._hits["rfoot"] = hits
+
+    def _paint_log(self) -> None:
+        c = self.canvas
+        c.delete("log")
+        g = self._geo()
+        x0, y0, x1, y1 = g["log"]
+        c.create_text(x0 + px(22), y0 + px(15), text="LOG", anchor="nw", font=font("disp", 12), fill=PAPER,
+                      tags="log")
+        line_h = px(17)
+        text_x = x0 + px(22) + px(60)
+        fnt = font("mono", 10)
+        room = max(x1 - text_x - px(18), 40)
+        y = y1 - px(14)
+        for entry in reversed(self._log):
+            if y < y0 + px(44):
+                break
+            fresh = min(entry["age"] / 0.35, 1.0)
+            c.create_text(x0 + px(22), y, text=entry["tag"], anchor="w", font=fnt, fill=DIM_2, tags="log")
+            c.create_text(text_x, y, text=clip(entry["text"], fnt, room), anchor="w", font=fnt,
+                          fill=mix(INK_2, entry["colour"], 0.35 + 0.65 * fresh), tags="log")
+            y -= line_h
+
+    def _log_line(self, tag: str, text: str, colour: Optional[str] = None) -> None:
+        self._log.append({"tag": tag, "text": text, "age": 0.0, "colour": colour or DIM})
+        del self._log[:-160]
+        if self._geo_cache is not None:
+            self._paint_log()
+
+    # -- batch strip
+
+    def _paint_film(self) -> None:
+        c = self.canvas
+        c.delete("film")
+        g = self._geo()
+        W = g["W"]
+        _x0, y0, _x1, y1 = g["film"]
+        n = len(self.paths)
+        rejected = sum(1 for entry in self.summary.values() if entry["found"])
+        passed = len(self.summary) - rejected
+        hy = y0 + px(19)
+        title = c.create_text(px(18), hy, text="BATCH", anchor="w", font=font("disp", 12), fill=PAPER,
+                              tags="film")
+        x = c.bbox(title)[2] + px(14)
+        chips = [("ALL {}".format(n), None, True), ("REJECT {}".format(rejected), REJECT, False),
+                 ("PASS {}".format(passed), PASS, False), ("QUEUED {}".format(n - len(self.summary)), DIM_2, False)]
+        for text, dot, on in chips:
+            fnt = font("mono", 10.5, on)
+            item = c.create_text(x + px(9) + (px(12) if dot else 0), hy, text=text, anchor="w", font=fnt,
+                                 fill=INK if on else DIM, tags="film")
+            right = c.bbox(item)[2] + px(9)
+            box = c.create_rectangle(x, hy - px(10), right, hy + px(10), fill=PAPER if on else "",
+                                     outline=PAPER if on else RULE, tags="film")
+            c.tag_lower(box, item)
+            if dot:
+                c.create_rectangle(x + px(9), hy - px(3), x + px(15), hy + px(3), fill=dot, outline="",
+                                   tags="film")
+            x = right + px(6)
+        c.create_text(W - px(18), hy, text="SORTED BY FILENAME", anchor="e", font=font("mono", 10.5),
+                      fill=DIM, tags="film")
+
+        fy0, fy1 = hy + px(18), y1 - px(10)
+        fw, gap, strip = px(54), px(7), px(15)
+        hits = []
+        for i in range(n):
+            fx = px(18) + i * (fw + gap)
+            if fx + fw > W - px(18):
+                break
+            preview = self._previews.get(i)
+            if preview is not None:
+                photo = self._remember(("frame", i, fw, fy1 - fy0),
+                                       lambda p=preview: ImageTk.PhotoImage(cover(p, fw - 2, fy1 - fy0 - 2)))
+                c.create_image(fx + 1, fy0 + 1, image=photo, anchor="nw", tags="film")
+            else:
+                c.create_rectangle(fx, fy0, fx + fw, fy1, fill=PANE, outline="", tags="film")
+            state = self._row_state(i)
+            if state == "done":
+                found = self.summary[i]["found"]
+                ground, ink, letter = (REJECT, INK, "R") if found else (PASS, INK, "P")
+            elif state == "live":
+                ground, ink, letter = RULE, MARK, "···"
+            else:
+                ground, ink, letter = RULE, DIM, "—"
+            c.create_rectangle(fx + 1, fy1 - strip, fx + fw, fy1, fill=ground, outline="", tags="film")
+            c.create_text(fx + fw // 2, fy1 - strip // 2, text=letter, font=font("mono", 9, True), fill=ink,
+                          tags="film")
+            on = i == self.index
+            if on:
+                c.create_rectangle(fx - px(2), fy0 - px(2), fx + fw + px(2), fy1 + px(2),
+                                   outline=mix(INK, MARK, 0.3), width=px(2), tags="film")
+            c.create_rectangle(fx, fy0, fx + fw, fy1, outline=MARK if on else RULE, tags="film")
+            hits.append((fx, fy0, fx + fw, fy1, i))
+        self._hits["film"] = hits
+
+    # -- input
+
+    def _hit(self, x: int, y: int) -> Tuple[str, object]:
+        for group in ("back", "rfoot", "pipe", "stages", "film"):
+            for x0, y0, x1, y1, key in self._hits.get(group, []):
+                if x0 <= x < x1 and y0 <= y < y1:
+                    return group, key
+        return "", None
+
+    def _set_hover(self, hover: str) -> None:
+        if hover != self._hover:
+            self._hover = hover
+            self._paint_bar()
+            self._paint_rfoot()
+
+    def _on_motion(self, event) -> None:
+        group, key = self._hit(event.x, event.y)
+        clickable = group in ("back", "rfoot", "pipe", "stages") or (
+            group == "film" and self._row_state(key) != "queued")
+        self.canvas.configure(cursor="hand2" if clickable else "")
+        self._set_hover("back" if group == "back" else ("rfoot:" + key if group == "rfoot" else ""))
+
+    def _on_click(self, event) -> None:
+        group, key = self._hit(event.x, event.y)
+        if group == "back":
+            self.app.show_home()
+        elif group == "rfoot":
+            if key == "prev":
+                self._step(-1)
+            elif key == "next":
+                self._step(1)
+            elif key == "play":
+                self._toggle_play()
+            elif key == "save":
+                self._save_frame()
+        elif group in ("pipe", "stages"):
+            self._jump(key)
+        elif group == "film":
+            state = self._row_state(key)
+            if state == "done":
+                self._review(key)
+            elif state == "live":
+                self._go_live()
 
     def _toggle_play_event(self, _event) -> None:
         self._toggle_play()
@@ -1192,8 +1101,8 @@ class RunScreen(tk.Frame):
         self.playing = not self.playing
         if self.playing and self.stage_i < 0:
             self._begin_trace()
-        self._film_dirty = True
-        self._paint_bottom()
+        self._paint_bar()
+        self._paint_rail()
 
     def _save_frame(self) -> None:
         trace = self.traces.get(self.index)
@@ -1203,9 +1112,9 @@ class RunScreen(tk.Frame):
         folder = pipeline.OUTPUT_DIR / self.spec.slug
         target = folder / "{}_{:02d}_{}.png".format(Path(trace.name).stem, self.stage_i + 1, stage.key)
         if pipeline.imwrite_unicode(target, stage.frame()):
-            self._log_line("saved", str(target.relative_to(pipeline.PROJECT_ROOT)), accent=True)
+            self._log_line("saved", str(target.relative_to(pipeline.PROJECT_ROOT)), colour=MARK)
         else:
-            self._log_line("saved", "could not write {}".format(target), colour=neon.RED)
+            self._log_line("saved", "could not write {}".format(target), colour=REJECT)
 
     # -- the clock
 
@@ -1216,11 +1125,11 @@ class RunScreen(tk.Frame):
         if self._reveal < 1.0:
             self._reveal = min(1.0, self._reveal + delta * 3.2 * self.speed)
             if self._reveal >= 1.0 and self._reveal_to is not None:
-                self._current_pil = self._reveal_to
+                self._current = self._reveal_to
                 self._reveal_to = None
-            self._paint_viewport()
+            self._paint_main()
         elif self.stage_i < 0 and int(self._elapsed * 12) % 2 == 0:
-            self._paint_viewport()  # keeps the waiting dots moving
+            self._paint_main()  # keeps the waiting squares moving
 
         # progress follows the run, not whatever photo is being read
         live_trace = self.traces.get(self.live)
@@ -1229,6 +1138,10 @@ class RunScreen(tk.Frame):
         within = (live_stage + 1) / total if live_stage >= 0 else 0.0
         target = 1.0 if self.complete else (self.live + within) / max(len(self.paths), 1)
         self._bar_value += (target - self._bar_value) * min(1.0, delta * 4.0)
+        if self._prog is not None:
+            left, right, mid = self._prog
+            self.canvas.coords("progfill", left, mid - px(2), left + (right - left) * self._bar_value,
+                               mid + px(2))
 
         if self.playing and not self.reviewing and not self.complete:
             if self.stage_i < 0:
@@ -1239,32 +1152,13 @@ class RunScreen(tk.Frame):
                 if self._dwell_left <= 0:
                     self._advance()
 
-        now = int(self._elapsed * 2)
-        if now != self._top_stamp:
-            self._top_stamp = now
-            self._paint_top()
-
         for entry in self._log:
             if entry["age"] < 0.4:
                 entry["age"] += delta
                 self._paint_log()
                 break
 
-        if self.summary.get(self.index, {}).get("found"):
-            self._paint_bottom(self._hover_button)
-
-        if self._film_follow:
-            _side, row_h = self._film_metrics()
-            visible = max(self.film.winfo_height() - neon.px(26), row_h)
-            needed = row_h * len(self.paths)
-            goal = max(0.0, min((self.index + 0.5) * row_h - visible / 2,
-                                max(needed - visible, 0.0)))
-            if abs(goal - self._film_offset) > 0.4:
-                self._film_offset += (goal - self._film_offset) * min(1.0, delta * 8.0)
-                self._film_dirty = True
-            else:
-                self._film_follow = False
-        if self._film_dirty:
+        if self._film_dirty and self._geo_cache is not None:
             self._film_dirty = False
             self._paint_film()
 

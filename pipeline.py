@@ -111,6 +111,8 @@ class Trace:
     verdict: str = "PASS"
     elapsed: float = 0.0
     annotated: Optional[np.ndarray] = None
+    regions: int = 0                        # boxes the detector reported
+    size: Tuple[int, int] = (0, 0)          # width and height of the photo as captured
 
     @property
     def expected(self) -> bool:
@@ -728,6 +730,7 @@ def trace(spec: DefectSpec, path: Path, raw: Optional[np.ndarray] = None) -> Tra
         record.verdict = "READ-FAIL"
         record.details = "the file could not be decoded as an image"
         return record
+    record.size = (int(raw.shape[1]), int(raw.shape[0]))
 
     prepared = module.preprocess(raw, cfg.preprocess)
     segmentation = module.segment_glove(prepared, cfg.segmentation)
@@ -763,6 +766,7 @@ def trace(spec: DefectSpec, path: Path, raw: Optional[np.ndarray] = None) -> Tra
     result = module.detect(prepared, segmentation, cfg)
     record.found = bool(result.defect_found)
     record.score = float(result.score)
+    record.regions = len(result.locations)
     record.details = result.details
     record.verdict = "DEFECT" if record.found else "PASS"
     record.annotated = annotate(prepared, segmentation, result, accent)

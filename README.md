@@ -9,8 +9,9 @@ training data). Damage by fold, dirty, and tearing at the fingertip.
 C:\Tool\python\python.exe studio.py
 ```
 
-The launcher has one card per defect. Picking one runs every photo in `gloves/`
-straight away and replays the detector one step at a time, so the preprocessing,
+The launcher has one tile per defect, each showing a real glove from `gloves/`
+cut out with the detector's own segmentation (cached in `output/.landing/`).
+Picking one runs every photo in `gloves/` straight away and replays the detector one step at a time, so the preprocessing,
 the segmentation and the analysis are on screen rather than implied.
 
 ```
@@ -41,7 +42,8 @@ Microsoft Store stub.
 
 ```
 studio.py         entry point
-ui/studio.py      launcher and run screen      ui/neon.py   look and drawing helpers
+ui/qc.py          the QC floor look and the line screen      ui/studio.py   the inspect screen
+ui/neon.py        screen scaling and colour helpers
 pipeline.py       step tracing, calls each detector's own functions
 detectors/        one self contained file per defect
 runner.py         headless harness, used by evaluate.py
