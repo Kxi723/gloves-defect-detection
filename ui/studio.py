@@ -29,8 +29,11 @@ from ui.qc import (DETECTORS, DIM, DIM_2, INK, INK_2, MARK, PANE, PAPER, PASS, R
 
 TICK_MS = 33
 STAGE_DWELL_MS = 520
-VERDICT_DWELL_MS = 1700
-PLAYBACK_SPEED = 2.0  # frames play at twice the base dwell, the detector always runs flat out
+VERDICT_DWELL_MS = 3600
+# steps flash past at four times the base dwell (about 0.13 s each) since progress is
+# kept and any photo can be paused or reopened to read, while the verdict still holds
+# for about 0.9 s so the result can be taken in. The detector always runs flat out.
+PLAYBACK_SPEED = 4.0
 
 PHASE_NAMES = {"preprocess": "Preprocess", "segmentation": "Segment glove",
                "analysis": "Analyse", "verdict": "Verdict"}
